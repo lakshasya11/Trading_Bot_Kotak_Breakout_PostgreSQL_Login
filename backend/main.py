@@ -289,12 +289,18 @@ async def get_trade_history():
         try:
             with today_engine.connect() as conn:
                 df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
-                # Replace NaN values with None (which serializes to null in JSON)
-                df = df.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
-                return df.to_dict('records')
+                
+                # Manual cleanup to avoid pandas weakref serialization bugs
+                import numpy as np
+                records = df.to_dict('records')
+                for r in records:
+                    for k, v in r.items():
+                        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                            r[k] = None
+                return records
         except Exception as e:
             # Return empty list instead of error if table doesn't exist or is empty
-            print(f"[WARNING] Trade history fetch: {e}")
+            print(f"⚠️ Trade history fetch error: {e}")
             return []
     return await asyncio.to_thread(db_call)
 
@@ -304,30 +310,74 @@ async def get_all_trade_history():
         try:
             with all_engine.connect() as conn:
                 df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
-                # Replace NaN values with None (which serializes to null in JSON)
-                df = df.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
-                return df.to_dict('records')
+                
+                # Manual cleanup to avoid pandas weakref serialization bugs
+                import numpy as np
+                records = df.to_dict('records')
+                for r in records:
+                    for k, v in r.items():
+                        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                            r[k] = None
+                return records
         except Exception as e:
             # Return empty list instead of error if table doesn't exist or is empty
-            print(f"⚠️ All-time trade history fetch: {e}")
+            print(f"⚠️ All-time trade history fetch error: {e}")
             return []
     return await asyncio.to_thread(db_call)
 
 @app.get("/api/performance")
 async def get_performance(service: TradingBotService = Depends(get_bot_service)):
-    """Get current daily performance stats (useful for manual refresh)"""
+    """Get current daily performance stats (falls back to DB if bot not running)"""
     if service.strategy_instance:
         trades_today = service.strategy_instance.performance_stats["winning_trades"] + service.strategy_instance.performance_stats["losing_trades"]
         return {
             "grossPnl": service.strategy_instance.daily_gross_pnl,
             "totalCharges": service.strategy_instance.total_charges,
             "netPnl": service.strategy_instance.daily_net_pnl,
-            "net_pnl": service.strategy_instance.daily_net_pnl,  # Add snake_case alias for status bar
+            "net_pnl": service.strategy_instance.daily_net_pnl,
             "wins": service.strategy_instance.performance_stats["winning_trades"],
             "losses": service.strategy_instance.performance_stats["losing_trades"],
             "trades_today": trades_today
         }
     else:
+        # Fallback to Database Summary
+        def get_db_summary():
+            try:
+                import sqlite3
+                from core.database import TODAY_DB_PATH
+                if not os.path.exists(TODAY_DB_PATH): return None
+                
+                with sqlite3.connect(TODAY_DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    # Filter by today's trading mode if needed (default to Paper for summary)
+                    cursor.execute("""
+                        SELECT 
+                            SUM(pnl) as grossPnl, 
+                            SUM(charges) as totalCharges, 
+                            SUM(net_pnl) as netPnl,
+                            COUNT(*) as trades_today,
+                            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                            SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses
+                        FROM trades
+                    """)
+                    row = cursor.fetchone()
+                    if row and row['trades_today'] > 0:
+                        return {
+                            "grossPnl": row['grossPnl'] or 0,
+                            "totalCharges": row['totalCharges'] or 0,
+                            "netPnl": row['netPnl'] or 0,
+                            "net_pnl": row['netPnl'] or 0,
+                            "wins": row['wins'] or 0,
+                            "losses": row['losses'] or 0,
+                            "trades_today": row['trades_today'] or 0
+                        }
+            except Exception as e:
+                print(f"Error getting performance summary from DB: {e}")
+            return None
+            
+        summary = await asyncio.to_thread(get_db_summary)
+        if summary: return summary
         return {"grossPnl": 0, "totalCharges": 0, "netPnl": 0, "net_pnl": 0, "wins": 0, "losses": 0, "trades_today": 0}
 
 @app.post("/api/optimize")
@@ -442,6 +492,18 @@ async def websocket_endpoint(websocket: WebSocket, service: TradingBotService = 
             # CRITICAL FIX: Always send performance data even if zero (ensures UI shows correct state)
             await service.strategy_instance._update_ui_performance()
             await service.strategy_instance._update_ui_trade_status()
+            
+            # 🔥 SYNC COMPLETION: Send full trade history list on connect
+            try:
+                history = await get_trade_history()
+                await websocket.send_json({
+                    "type": "trade_history_resync",
+                    "payload": history
+                })
+                print(f"Trade history resync sent ({len(history)} trades)")
+            except Exception as e:
+                print(f"⚠️ Failed to send trade history resync: {e}")
+            
             print("State synchronization complete.")
         else:
             # Send initial state to this specific connection (not broadcast)
@@ -703,25 +765,10 @@ async def switch_user(user_id: str):
 async def get_active_user():
     """Get details of currently active user"""
     try:
-        with open("user_profiles.json", "r") as f:
-            data = json.load(f)
-        
-        active_user_id = data.get("active_user")
-        users = data.get("users", [])
-        
-        active_user = next((u for u in users if u["id"] == active_user_id), None)
-        
-        if not active_user:
-            raise HTTPException(status_code=404, detail="Active user not found in user_profiles.json")
-        
-        # Return without sensitive credentials
-        return {
-            "id": active_user["id"],
-            "name": active_user["name"],
-            "description": active_user.get("description", "")
-        }
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="user_profiles.json not found")
+        user_info = _get_active_user_info()
+        if user_info.get("id") == "unknown":
+             raise HTTPException(status_code=404, detail="Active user not found")
+        return user_info
     except HTTPException:
         raise
     except Exception as e:

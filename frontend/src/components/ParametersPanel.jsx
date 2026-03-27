@@ -71,7 +71,7 @@ export default function ParametersPanel({ isMock = false }) {
 
     const [auth, setAuth] = useState({ status: 'loading', login_url: '', user: '' });
     const [reqToken, setReqToken] = useState('');
-    const [availableExpiries, setAvailableExpiries] = useState([]);
+    const [availableExpiries, setAvailableExpiries] = useState(() => params.option_expiry_type ? [params.option_expiry_type] : []);
     const [loadingExpiries, setLoadingExpiries] = useState(false);
     const [usingDefaultExpiries, setUsingDefaultExpiries] = useState(true);
     
@@ -324,9 +324,19 @@ export default function ParametersPanel({ isMock = false }) {
                                     disabled={isBotRunning || isSpectator || (field.name === 'option_expiry_type' && field.loading)}
                                 >
                                     {field.name === 'option_expiry_type' && loadingExpiries ? (
-                                        <MenuItem disabled>Loading real expiries...</MenuItem>
+                                        <MenuItem disabled value="">Loading real expiries...</MenuItem>
                                     ) : (
-                                        field.options.map(opt => <MenuItem key={opt} value={opt}>{opt}</MenuItem>)
+                                        (() => {
+                                            // Ensure current value is in options to prevent MUI "out-of-range" warning
+                                            let finalOptions = [...field.options];
+                                            const currentVal = params[field.name];
+                                            if (currentVal && !finalOptions.includes(currentVal)) {
+                                                finalOptions = [currentVal, ...finalOptions];
+                                            }
+                                            return finalOptions.map(opt => (
+                                                <MenuItem key={opt} value={opt}>{opt}</MenuItem>
+                                            ));
+                                        })()
                                     )}
                                 </Select>
                                 {field.name === 'option_expiry_type' && usingDefaultExpiries && !loadingExpiries && (

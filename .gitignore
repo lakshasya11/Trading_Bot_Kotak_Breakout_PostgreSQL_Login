@@ -33,6 +33,8 @@ last_run_date.txt
 .env
 backend/broker_config.json
 users.json
+backend/ml_model.pkl
+frontend/.env
 
 # IDE
 .vscode/

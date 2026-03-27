@@ -333,19 +333,15 @@ function App() {
                         case 'new_trade_log':
                             handleCase('new_trade_log', () => {
                                 const trade = data.payload;
-                                console.log(`📝 TRADE RECEIVED from backend:`, {
-                                    symbol: trade?.symbol,
-                                    entry_price: trade?.entry_price,
-                                    exit_price: trade?.exit_price,
-                                    pnl: trade?.pnl,
-                                    net_pnl: trade?.net_pnl,
-                                    timestamp: trade?.timestamp,
-                                    exit_reason: trade?.exit_reason
-                                });
-                                const newState = getState().tradeHistory.length;
+                                console.log(`📝 TRADE RECEIVED from backend:`, trade?.symbol);
                                 getState().addTradeToHistory(trade);
-                                const updatedState = getState().tradeHistory.length;
-                                console.log(`✅ Trade added to history. Count: ${newState} → ${updatedState}`);
+                            });
+                            break;
+                            
+                        case 'trade_history_resync':
+                            handleCase('trade_history_resync', () => {
+                                console.log(`🔄 TRADE HISTORY RESYNC (Count: ${data.payload.length})`);
+                                getState().setTradeHistory(data.payload);
                             });
                             break;
                         case 'option_chain_update':
@@ -371,9 +367,12 @@ function App() {
                             handleCase('play_sound', () => {
                                 console.log(`🔊 Sound request received: ${data.payload}`);
                                 if (sounds[data.payload]) {
-                                    sounds[data.payload].play()
-                                        .then(() => console.log(`✅ Sound played: ${data.payload}`))
-                                        .catch(err => console.error(`❌ Sound play failed: ${data.payload}`, err));
+                                    try {
+                                        sounds[data.payload].play();
+                                        console.log(`✅ Sound played: ${data.payload}`);
+                                    } catch (err) {
+                                        console.error(`❌ Sound play failed: ${data.payload}`, err);
+                                    }
                                 } else {
                                     console.error(`❌ Sound not found: ${data.payload}`);
                                 }
@@ -565,7 +564,7 @@ function App() {
                 // This ensures P&L and trade list are immediately in sync even if events were missed while hidden.
                 // Note: current trade position and prices are kept up-to-date by the WebSocket stream (batch_frame_update).
                 try {
-                    const backendURL = getBackendURL();
+                    const backendURL = 'http://localhost:8000';
                     const [perfRes, historyRes] = await Promise.allSettled([
                         fetch(`${backendURL}/api/performance`),
                         fetch(`${backendURL}/api/trade_history`),

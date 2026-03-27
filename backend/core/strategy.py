@@ -7433,7 +7433,10 @@ class Strategy:
                 "daily_sl", "daily_pt", "partial_profit_pct", "partial_exit_pct", 
                 "recovery_threshold_pct", "max_lots_per_order",
                 "trade_pt", "break_even_threshold_pct",
-                "green_hold_min_profit_pct", "green_hold_max_loss_pct"  # 🟢 Green candle hold parameters
+                "green_hold_min_profit_pct", "green_hold_max_loss_pct",
+                "paper_entry_delay_ms", "paper_exit_delay_ms", "paper_verification_delay_ms",
+                "supertrend_period", "supertrend_multiplier", "atr_multiplier",
+                "option_atr_period", "option_atr_multiplier", "break_even_percent"
             ]
             for key in keys_to_convert:
                 if key in p:
