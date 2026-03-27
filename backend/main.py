@@ -562,7 +562,7 @@ async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_
         user_name = cfg.get("kotak_user_name", "Trader")
         client_id = cfg.get("kotak_ucc", "")
         if user_email:
-            http_req.post(
+            resp = http_req.post(
                 "http://localhost:5001/api/send-bot-alert",
                 json={
                     "email": user_email,
@@ -573,8 +573,11 @@ async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_
                 },
                 timeout=5
             )
+            print(f"[Email] Bot start alert sent to {user_email} — status: {resp.status_code}")
+        else:
+            print("[Email] kotak_email not set in broker_config.json — skipping bot start email")
     except Exception as e:
-        print(f"Bot start email error: {e}")
+        print(f"[Email] Bot start email error: {e}")
 
     return result
 
