@@ -901,6 +901,7 @@ async def switch_user(user_id: str):
             cfg["kotak_totp_secret"] = user.get("totp_secret", cfg.get("kotak_totp_secret", ""))
             cfg["kotak_mpin"] = user.get("mpin", cfg.get("kotak_mpin", ""))
             cfg["kotak_user_name"] = user.get("name", cfg.get("kotak_user_name", ""))
+            cfg["kotak_access_token"] = user.get("access_token", cfg.get("kotak_access_token", ""))
             with open("broker_config.json", "w") as f:
                 json.dump(cfg, f, indent=4)
             return {
