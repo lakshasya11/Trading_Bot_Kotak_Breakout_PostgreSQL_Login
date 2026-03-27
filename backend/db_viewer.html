@@ -427,13 +427,12 @@ async function loadBanner() {
         new Date().toLocaleDateString('en-IN',
             { weekday:'short', day:'2-digit', month:'short', year:'numeric' });
 
-    // Kotak ID + Name  →  backend /api/users/active
+    // Kotak UCC + Name  →  backend /api/users/active
     try {
         const r = await fetch(window.location.origin + '/api/users/active');
         if (r.ok) {
             const u = await r.json();
-            document.getElementById('bKotak').textContent =
-                (u.description || '').replace('Kotak UCC: ','') || u.id || '—';
+            document.getElementById('bKotak').textContent = u.id || '—';
             document.getElementById('bName').textContent  = u.name || '—';
         } else throw 0;
     } catch {
