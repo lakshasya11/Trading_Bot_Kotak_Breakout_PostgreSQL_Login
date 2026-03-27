@@ -73,26 +73,18 @@ last_request_times = defaultdict(float)
 
 
 def _send_bot_stop_email(reason: str = "Bot Stopped"):
-    """Send bot stopped email notification via login server. Non-blocking, never raises."""
+    """Send full Bot Session Report email via SessionLogger.log_logout."""
     try:
-        import requests as _req
+        import json as _json
+        from core.session_logger import SessionLogger
         with open("broker_config.json", "r") as f:
-            cfg = json.load(f)
-        user_email = cfg.get("kotak_email", "")
-        if user_email:
-            _req.post(
-                "http://localhost:5001/api/send-bot-alert",
-                json={
-                    "email": user_email,
-                    "name": cfg.get("kotak_user_name", "Trader"),
-                    "client_id": cfg.get("kotak_ucc", ""),
-                    "event": "stopped",
-                    "reason": reason
-                },
-                timeout=5
-            )
+            cfg = _json.load(f)
+        kotak_ucc = cfg.get("kotak_ucc", "")
+        if kotak_ucc:
+            SessionLogger.log_logout(client_id=kotak_ucc)
+            print(f"[Email] Bot Session Report sent ({reason})")
     except Exception as e:
-        print(f"Bot stop email error: {e}")
+        print(f"[Email] Bot stop email error: {e}")
 
 
 def _get_active_user_info() -> dict:
@@ -171,18 +163,29 @@ async def _daily_summary_scheduler():
             from dotenv import load_dotenv
             from core.email_notifier import EmailNotifier
 
-            # Ensure login/server/.env is loaded for NOTIFICATION_EMAIL & SMTP settings
+            # Load SMTP settings from login/server/.env
             _env_path = os.path.join(os.path.dirname(__file__), '..', 'login', 'server', '.env')
             load_dotenv(os.path.normpath(_env_path), override=True)
 
             with open("broker_config.json", "r") as f:
                 cfg = _json.load(f)
 
-            client_id = cfg.get("kotak_ucc", "")
-            name = cfg.get("kotak_user_name", "Trader")
-            mode = "LIVE"
+            kotak_ucc  = cfg.get("kotak_ucc", "")
+            kotak_name = cfg.get("kotak_user_name", "Trader")
 
-            # Use kotak_email as fallback if NOTIFICATION_EMAIL not set
+            # Get signup Client ID from users.json
+            signup_client_id = kotak_ucc
+            try:
+                import os as _os
+                users_path = _os.path.join(_os.path.dirname(__file__), '..', 'login', 'server', 'users.json')
+                with open(_os.path.normpath(users_path), 'r') as uf:
+                    users = _json.load(uf)
+                if users:
+                    signup_client_id = users[0].get('client_id') or users[0].get('clientId') or kotak_ucc
+            except Exception:
+                pass
+
+            # Fallback NOTIFICATION_EMAIL
             if not os.getenv("NOTIFICATION_EMAIL") and cfg.get("kotak_email"):
                 os.environ["NOTIFICATION_EMAIL"] = cfg["kotak_email"]
 
@@ -194,17 +197,14 @@ async def _daily_summary_scheduler():
             trades_list = df.to_dict("records") if not df.empty else []
             total_trades = len(trades_list)
             net_pnl = float(df["net_pnl"].sum()) if not df.empty and "net_pnl" in df.columns else 0.0
-            wins = int((df["net_pnl"] > 0).sum()) if not df.empty and "net_pnl" in df.columns else 0
-            losses = total_trades - wins
-
-            # Detect mode from trades
-            if not df.empty and "trading_mode" in df.columns:
-                mode = "LIVE" if "Live" in str(df["trading_mode"].iloc[0]) else "PAPER"
+            wins    = int((df["net_pnl"] > 0).sum()) if not df.empty and "net_pnl" in df.columns else 0
+            losses  = total_trades - wins
+            mode    = "LIVE" if (not df.empty and "trading_mode" in df.columns and "Live" in str(df["trading_mode"].iloc[0])) else "PAPER"
 
             EmailNotifier.send_daily_summary(
-                client_id=client_id,
-                name=name,
-                kite_id=client_id,
+                client_id=signup_client_id,
+                name=kotak_name,
+                kite_id=kotak_ucc,
                 mode=mode,
                 total_trades=total_trades,
                 net_pnl=net_pnl,
@@ -276,7 +276,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"Error during bot shutdown: {e}")
         # Case 4: server stopped (internet/crash/manual kill)
-        await asyncio.to_thread(_send_bot_stop_email, "Server Shutdown")
+        try:
+            import json as _json
+            from core.session_logger import SessionLogger
+            with open("broker_config.json", "r") as f:
+                cfg = _json.load(f)
+            SessionLogger.log_logout(client_id=cfg.get("kotak_ucc", ""))
+        except Exception as e:
+            print(f"[Email] Shutdown session report error: {e}")
     
     # Mark kite as shutting down
     if hasattr(kite, 'shutdown'):
@@ -1035,7 +1042,7 @@ async def logout(service: TradingBotService = Depends(get_bot_service)):
             }
         })
 
-        # Case 1: Logout button pressed
+        # Case 1: Logout button pressed — send full session report
         await asyncio.to_thread(_send_bot_stop_email, "User Logged Out")
 
         # Give clients time to process messages before disconnecting

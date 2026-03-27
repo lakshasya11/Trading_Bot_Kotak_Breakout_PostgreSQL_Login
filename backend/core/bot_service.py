@@ -355,6 +355,23 @@ class TradingBotService:
                 # Mark bot as running
                 self.is_running = True
                 
+                # Send bot login email notification
+                try:
+                    import json as _json
+                    from core.session_logger import SessionLogger
+                    with open("broker_config.json", "r") as f:
+                        cfg = _json.load(f)
+                    kotak_ucc = cfg.get("kotak_ucc", "")
+                    kotak_name = cfg.get("kotak_user_name", "Trader")
+                    mode = "LIVE" if params.get("trading_mode", "").lower() == "live trading" else "PAPER"
+                    SessionLogger.log_login(
+                        client_id=kotak_ucc,
+                        name=kotak_name,
+                        mode=mode
+                    )
+                except Exception as e:
+                    print(f"[Email] Bot login notification error: {e}")
+
                 print("Bot started successfully and ticker is connected.")
                 return {"status": "success", "message": "Bot started and connected."}
 
@@ -478,13 +495,19 @@ class TradingBotService:
                 
                 # Reset state
                 self.is_running = False
-                
-                print("Bot stopped successfully.")
-                
-                # --- NEW LINE ---
-                # Proactively reload the token from the file to restore the session.
-                re_initialize_session_from_file()
 
+                # Send Bot Session Report email
+                try:
+                    import json as _json
+                    from core.session_logger import SessionLogger
+                    with open("broker_config.json", "r") as f:
+                        cfg = _json.load(f)
+                    SessionLogger.log_logout(client_id=cfg.get("kotak_ucc", ""))
+                except Exception as e:
+                    print(f"[Email] Logout notification error: {e}")
+
+                print("Bot stopped successfully.")
+                re_initialize_session_from_file()
                 return {"status": "success", "message": "Bot stopped successfully"}
                 
             except Exception as e:
