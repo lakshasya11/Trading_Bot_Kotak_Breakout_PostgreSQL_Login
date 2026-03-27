@@ -59,21 +59,28 @@ if BROKER_NAME == "kotak":
     access_token = _kotak_instance._session_token or _kotak_instance._access_token
 
     def generate_session_and_set_token(request_token_or_unused=None):
-        """
-        For Kotak the auth flow is consumer_key + login + 2FA.
-        ``request_token`` is ignored; credentials come from broker_config.
-        """
         try:
+            # Always reload config to get latest credentials
+            fresh_cfg = _load_broker_config()
+            _kotak_instance._config = fresh_cfg
+            _kotak_instance._access_token = fresh_cfg.get("kotak_access_token", "")
             session = _kotak_instance.generate_session("", "")
             global access_token
             access_token = session.get("access_token")
-            return True, {"user_id": _broker_config.get("kotak_user_id", "KOTAK_USER")}
+            return True, {"user_id": fresh_cfg.get("kotak_ucc", "KOTAK_USER")}
         except Exception as e:
             return False, str(e)
 
     def re_initialize_session_from_file():
         """Attempt to restore / create a Kotak session on startup."""
         print("--- Kotak: Attempting auto-login from broker_config.json ---")
+        # Reload config fresh from file to pick up any user switches
+        try:
+            fresh_cfg = _load_broker_config()
+            _kotak_instance._config = fresh_cfg
+            _kotak_instance._access_token = fresh_cfg.get("kotak_access_token", "")
+        except Exception as e:
+            print(f"[WARNING] Could not reload broker config: {e}")
         success, data = generate_session_and_set_token()
         if success:
             print(f"[OK] Kotak session established.")
