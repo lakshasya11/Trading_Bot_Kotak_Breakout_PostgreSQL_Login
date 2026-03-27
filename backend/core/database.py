@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env
 load_dotenv()
 
+# --- BACKEND ROOT DIRECTORY ---
+CORE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(CORE_DIR)
+
 # Get PostgreSQL credentials from environment
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")

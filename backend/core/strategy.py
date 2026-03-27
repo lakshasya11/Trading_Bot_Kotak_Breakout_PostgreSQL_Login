@@ -118,8 +118,9 @@ class Strategy:
         self.params = self._sanitize_params(params)
         self.manager = manager
         
-        # 🔥 MULTI-USER TRACKING: Load active user name for DB logging
+        # 🔥 MULTI-USER TRACKING: Load active user name and UCC for DB logging
         self.user_name = "System"
+        self.ucc = ""
         try:
             import os
             import json
@@ -128,6 +129,7 @@ class Strategy:
                 with open(config_path, 'r') as f:
                     config = json.load(f)
                     self.user_name = config.get("kotak_user_name", "Unknown Kotak User")
+                    self.ucc = config.get("kotak_ucc", "")
         except Exception as e:
             print(f"⚠️ Error loading user name for strategy: {e}")
         self.ticker_manager: Optional["KiteTickerManager"] = None
@@ -4714,6 +4716,8 @@ class Strategy:
                         log_info_failed = {
                             "timestamp": exit_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"),
                             "trigger_reason": p.get("trigger_reason", "EXIT_FAILED"),
+                            "user_name": self.user_name,
+                            "ucc": self.ucc,
                             "symbol": p["symbol"],
                             "quantity": p["qty"],
                             "pnl": 0,
@@ -4749,7 +4753,9 @@ class Strategy:
                             "entry_type": p.get("entry_type", "UNKNOWN"),
                             "supertrend_hold_mode": p.get("supertrend_hold_mode", "UNKNOWN"),
                             "entry_option_st_state": p.get("entry_option_st_state", "UNKNOWN"),
-                            "exit_supertrend_reason": f"FAILED: {error_msg[:50]}"
+                            "exit_supertrend_reason": f"FAILED: {error_msg[:50]}",
+                            "direction": p.get("direction"),
+                            "exit_mode": "FAILED"
                         }
                         
                         # Log the failed exit to database
@@ -4931,6 +4937,7 @@ class Strategy:
                 "timestamp": exit_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"), 
                 "trigger_reason": p.get("trigger_reason", reason), 
                 "user_name": self.user_name,
+                "ucc": self.ucc,
                 "symbol": p["symbol"], 
                 "quantity": p["qty"], 
                 "pnl": _final_pnl, 
@@ -4965,8 +4972,9 @@ class Strategy:
                 "predictive_structure": p.get("predictive_structure", 0),
                 "predictive_checks_passed": p.get("predictive_checks_passed", 0),
                 "trigger_system": p.get("trigger_system", "UNKNOWN"),
-                # 🆕 ENTRY TYPE DIFFERENTIATION
                 "entry_type": p.get("entry_type", "UNKNOWN"),
+                "direction": p.get("direction"),
+                "exit_mode": "FULL",
                 # 🆕 SUPERTREND HOLD MODE DIFFERENTIATION
                 "supertrend_hold_mode": p.get("supertrend_hold_mode", "UNKNOWN"),
                 "entry_option_st_state": p.get("entry_option_st_state", "UNKNOWN"),
@@ -5039,10 +5047,10 @@ class Strategy:
                         else:
                             await self._log_debug("TRADE-LOG-FAILED", f"❌ Failed to log trade after {max_retries} attempts: {log_error}")
             
-            # 🚀 START LOGGING IN BACKGROUND (non-blocking)
-            asyncio.create_task(log_trade_with_retry())
-            
-            # 🚀 BROADCAST to UI IMMEDIATELY for instant display
+            # Write to DB first (with retry), then broadcast - prevents resync race condition
+            await log_trade_with_retry()
+
+            # Broadcast AFTER DB write confirmed
             await self.manager.broadcast({"type": "new_trade_log", "payload": log_info})
             
             # 📝 Log completion message - with SAFE formatting
@@ -5768,11 +5776,11 @@ class Strategy:
                 "exit_supertrend_reason": p.get("exit_supertrend_reason", "N/A")
             }
             
-            # 🚀 CRITICAL: Broadcast to UI IMMEDIATELY (non-blocking to prevent WebSocket disconnects)
-            asyncio.create_task(self.manager.broadcast({"type": "new_trade_log", "payload": log_info}))
-            
-            # ✅ Log to database (blocking to ensure write commits)
+            # Write to DB first, then broadcast - consistent with main exit
             await self.trade_logger.log_trade(log_info)
+
+            # Broadcast AFTER DB write confirmed
+            await self.manager.broadcast({"type": "new_trade_log", "payload": log_info})
             p["qty"] -= qty_to_exit; self.next_partial_profit_level += 1
             await self._log_debug("Profit.Take", f"Remaining quantity: {p['qty']}.")
             await self._update_ui_trade_status(); await self._update_ui_performance()

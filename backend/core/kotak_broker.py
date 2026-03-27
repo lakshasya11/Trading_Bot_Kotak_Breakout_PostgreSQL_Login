@@ -270,7 +270,7 @@ class KotakBroker(BrokerInterface):
         return {
             "instrument_token": (inst.get("pScripRefKey") or
                                  inst.get("token") or
-                                 inst.get("instrument_token", "")),
+                                 inst.get("instrument_token", "") or ""),
             "tradingsymbol": (inst.get("pTrdSymbol") or
                               inst.get("tradingSymbol") or
                               inst.get("tsym", "")),
@@ -772,8 +772,16 @@ class KotakBroker(BrokerInterface):
                 except (ValueError, TypeError):
                     freeze_qty = 0
 
+                scrip_ref_key = (row.get("pScripRefKey", "") or "").strip()
+                # Use pScripRefKey as token if available (unique identifier)
+                # Fall back to pSymbol only if pScripRefKey is missing
+                try:
+                    token_val = int(float(scrip_ref_key)) if scrip_ref_key and scrip_ref_key.isdigit() else int(float(row.get("pSymbol", 0) or 0))
+                except (ValueError, TypeError):
+                    token_val = int(float(row.get("pSymbol", 0) or 0))
+
                 inst = {
-                    "instrument_token": int(float(row.get("pSymbol", 0) or 0)),
+                    "instrument_token": token_val,
                     "tradingsymbol": row.get("pTrdSymbol", "").strip(),
                     "lot_size": int(float(row.get("lLotSize", 1) or 1)),
                     "expiry": expiry_date,

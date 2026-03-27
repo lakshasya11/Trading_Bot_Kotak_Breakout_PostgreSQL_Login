@@ -66,10 +66,33 @@ from core.strategy import MARKET_STANDARD_PARAMS
 from core.optimiser import OptimizerBot
 from core.trade_logger import TradeLogger
 from core.bot_service import TradingBotService, get_bot_service
-from core.database import today_engine, all_engine
+from core.database import today_engine, all_engine, sql_text
 
 # ===== COOLDOWN MECHANISM =====
 last_request_times = defaultdict(float)
+
+
+def _send_bot_stop_email(reason: str = "Bot Stopped"):
+    """Send bot stopped email notification via login server. Non-blocking, never raises."""
+    try:
+        import requests as _req
+        with open("broker_config.json", "r") as f:
+            cfg = json.load(f)
+        user_email = cfg.get("kotak_email", "")
+        if user_email:
+            _req.post(
+                "http://localhost:5001/api/send-bot-alert",
+                json={
+                    "email": user_email,
+                    "name": cfg.get("kotak_user_name", "Trader"),
+                    "client_id": cfg.get("kotak_ucc", ""),
+                    "event": "stopped",
+                    "reason": reason
+                },
+                timeout=5
+            )
+    except Exception as e:
+        print(f"Bot stop email error: {e}")
 
 
 def _get_active_user_info() -> dict:
@@ -186,6 +209,8 @@ async def lifespan(app: FastAPI):
             print("Bot shutdown timed out")
         except Exception as e:
             print(f"Error during bot shutdown: {e}")
+        # Case 4: server stopped (internet/crash/manual kill)
+        await asyncio.to_thread(_send_bot_stop_email, "Server Shutdown")
     
     # Mark kite as shutting down
     if hasattr(kite, 'shutdown'):
@@ -452,12 +477,41 @@ async def reset_parameters(service: TradingBotService = Depends(get_bot_service)
 @app.post("/api/start")
 async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
     cooldown_check("start", cooldown_seconds=2.0)
-    return await service.start_bot(req.params, req.selectedIndex)
+    result = await service.start_bot(req.params, req.selectedIndex)
+
+    # Send bot started email notification
+    try:
+        import requests as http_req
+        import json as _json
+        with open("broker_config.json", "r") as f:
+            cfg = _json.load(f)
+        user_email = cfg.get("kotak_email", "")
+        user_name = cfg.get("kotak_user_name", "Trader")
+        client_id = cfg.get("kotak_ucc", "")
+        if user_email:
+            http_req.post(
+                "http://localhost:5001/api/send-bot-alert",
+                json={
+                    "email": user_email,
+                    "name": user_name,
+                    "client_id": client_id,
+                    "event": "started",
+                    "index": req.selectedIndex
+                },
+                timeout=5
+            )
+    except Exception as e:
+        print(f"Bot start email error: {e}")
+
+    return result
 
 @app.post("/api/stop")
 async def stop_bot(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
     cooldown_check("stop", cooldown_seconds=1.0)
-    return await service.stop_bot()
+    result = await service.stop_bot()
+    # Case 2: Stop bot button pressed from dashboard
+    await asyncio.to_thread(_send_bot_stop_email, "Stopped by User")
+    return result
 
 @app.post("/api/pause")
 async def pause_bot(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
@@ -792,6 +846,113 @@ async def reset_kill_switch():
     from core.kill_switch import kill_switch
     kill_switch.manual_reset()
     return {"success": True, "message": "Kill switch has been manually reset"}
+
+@app.post("/api/logout")
+async def logout(service: TradingBotService = Depends(get_bot_service)):
+    """Logout endpoint that stops bot, clears session, and disconnects all clients"""
+    cooldown_check("logout", cooldown_seconds=2.0)
+
+    try:
+        print("Logout initiated - stopping bot and clearing session...")
+
+        # 1. Stop the bot if running
+        if service.ticker_manager_instance or service.strategy_instance or service.is_running:
+            try:
+                # Stop ticker first
+                if service.ticker_manager_instance:
+                    await service.ticker_manager_instance.stop()
+                    print("Ticker stopped for logout")
+
+                # Exit positions with timeout
+                if service.strategy_instance and service.strategy_instance.position:
+                    try:
+                        await asyncio.wait_for(
+                            service.strategy_instance.exit_position("User Logout"),
+                            timeout=8.0
+                        )
+                        print("Positions exited for logout")
+                    except asyncio.TimeoutError:
+                        print("Position exit timed out during logout")
+                    except Exception as e:
+                        print(f"Error during position exit on logout: {e}")
+
+                # Stop background tasks
+                if service.uoa_scanner_task and not service.uoa_scanner_task.done():
+                    service.uoa_scanner_task.cancel()
+                if service.continuous_monitor_task and not service.continuous_monitor_task.done():
+                    service.continuous_monitor_task.cancel()
+
+                # Cleanup bot state
+                await service._cleanup_bot_state()
+                service.is_running = False
+
+                print("Bot stopped successfully for logout")
+
+            except Exception as e:
+                print(f"Error stopping bot during logout: {e}")
+
+        # 2. Clear the access token to invalidate session
+        from core.broker_factory import clear_access_token
+        try:
+            clear_access_token()
+            print("Access token cleared")
+        except Exception as e:
+            print(f"Error clearing access token: {e}")
+
+        # 3. Broadcast logout message to all connected clients
+        await manager.broadcast({
+            "type": "logout_notification",
+            "payload": {
+                "message": "Bot stopped - User logged out",
+                "redirect_url": "http://localhost:3001/"
+            }
+        })
+
+        # 4. Send final disconnected status
+        await manager.broadcast({
+            "type": "status_update",
+            "payload": {
+                "connection": "DISCONNECTED",
+                "mode": "NOT STARTED",
+                "is_running": False,
+                "is_paused": False,
+                "indexPrice": 0,
+                "trend": "---",
+                "indexName": "INDEX"
+            }
+        })
+
+        # Case 1: Logout button pressed
+        await asyncio.to_thread(_send_bot_stop_email, "User Logged Out")
+
+        # Give clients time to process messages before disconnecting
+        await asyncio.sleep(1.0)
+
+        # 5. Disconnect all WebSocket connections
+        await manager.disconnect_all()
+        print("All WebSocket connections closed")
+
+        print("Logout completed successfully")
+        return {
+            "status": "success",
+            "message": "Bot stopped - Logout successful",
+            "redirect_url": "http://localhost:3001/"
+        }
+
+    except Exception as e:
+        print(f"Error during logout: {e}")
+        try:
+            from core.broker_factory import clear_access_token
+            clear_access_token()
+            await manager.disconnect_all()
+        except:
+            pass
+
+        return {
+            "status": "error",
+            "message": f"Logout completed with errors: {str(e)}",
+            "redirect_url": "http://localhost:3001/"
+        }
 
 if __name__ == "__main__":
     import sys

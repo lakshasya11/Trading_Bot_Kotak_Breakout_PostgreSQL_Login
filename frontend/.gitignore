@@ -14,7 +14,8 @@ yarn-error.log*
 .vite-ssg-temp/
 
 # Environment variables
-
+.env
+*.env
 
 # IDE & System Files
 .vscode/

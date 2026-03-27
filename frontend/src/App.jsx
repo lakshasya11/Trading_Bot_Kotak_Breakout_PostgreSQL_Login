@@ -16,7 +16,7 @@ import StraddleMonitor from './components/StraddleMonitor';
 import TrendDirectionScoutPanel from './components/TrendDirectionScoutPanel';
 import UserSelector from './components/UserSelector';
 import { createSocketConnection } from './services/socket';
-import { manualExit, getTradeHistory, getTradeHistoryAll } from './services/api';
+import { manualExit, getTradeHistory, getTradeHistoryAll, logout } from './services/api';
 import { useStore } from './store/store';
 import { useSnackbar } from 'notistack';
 import tradingTheme from './theme';
@@ -332,9 +332,15 @@ function App() {
                             break;
                         case 'new_trade_log':
                             handleCase('new_trade_log', () => {
-                                const trade = data.payload;
-                                console.log(`📝 TRADE RECEIVED from backend:`, trade?.symbol);
-                                getState().addTradeToHistory(trade);
+                                // Fetch fresh from DB so trade has auto-generated id
+                                getTradeHistory().then(history => {
+                                    if (history && history.length > 0) {
+                                        getState().setTradeHistory(history);
+                                    }
+                                }).catch(() => {
+                                    // Fallback: add directly if fetch fails
+                                    getState().addTradeToHistory(data.payload);
+                                });
                             });
                             break;
                             
@@ -342,6 +348,13 @@ function App() {
                             handleCase('trade_history_resync', () => {
                                 console.log(`🔄 TRADE HISTORY RESYNC (Count: ${data.payload.length})`);
                                 getState().setTradeHistory(data.payload);
+                                // Merge today's trades into allTimeTradeHistory so Analytics "All Time" stays in sync
+                                const allTime = getState().allTimeTradeHistory || [];
+                                const existingIds = new Set(allTime.map(t => t.id || t.timestamp));
+                                const newTrades = data.payload.filter(t => !existingIds.has(t.id || t.timestamp));
+                                if (newTrades.length > 0) {
+                                    getState().setAllTimeTradeHistory([...allTime, ...newTrades]);
+                                }
                             });
                             break;
                         case 'option_chain_update':
@@ -386,8 +399,19 @@ function App() {
                             handleCase('system_warning', () => {
                                 enqueueSnackbar(data.payload.message, {
                                     variant: 'warning',
-                                    persist: true, // Keep message visible
+                                    persist: true,
                                 });
+                            });
+                            break;
+                        case 'logout_notification':
+                            handleCase('logout_notification', () => {
+                                enqueueSnackbar(data.payload.message, {
+                                    variant: 'info',
+                                    autoHideDuration: 3000
+                                });
+                                setTimeout(() => {
+                                    window.location.href = data.payload?.redirect_url || 'http://localhost:3000';
+                                }, 1500);
                             });
                             break;
                     }
@@ -580,6 +604,15 @@ function App() {
                     if (historyRes.status === 'fulfilled' && historyRes.value.ok) {
                         const historyData = await historyRes.value.json();
                         useStore.getState().setTradeHistory(historyData);
+                        // Merge today's trades into allTimeTradeHistory to keep it in sync
+                        const existingIds = new Set((useStore.getState().allTimeTradeHistory || []).map(t => t.id || t.timestamp));
+                        const newTrades = historyData.filter(t => !existingIds.has(t.id || t.timestamp));
+                        if (newTrades.length > 0) {
+                            useStore.getState().setAllTimeTradeHistory([
+                                ...(useStore.getState().allTimeTradeHistory || []),
+                                ...newTrades
+                            ]);
+                        }
                     }
 
                     console.log('✅ Full state resync complete on visibility change');
@@ -915,9 +948,46 @@ function App() {
                                 {botStatus?.connection || 'DISCONNECTED'} • {botStatus?.indexName || 'INDEX'}: {botStatus?.indexPrice?.toFixed(2) ?? '0.00'}
                             </Typography>
                         </Box>
-                        <ErrorBoundary name="UserSelector">
-                            <UserSelector />
-                        </ErrorBoundary>
+                        <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                            <ErrorBoundary name="UserSelector">
+                                <UserSelector />
+                            </ErrorBoundary>
+                            <button
+                                onClick={async () => {
+                                    try {
+                                        if (window.confirm('Are you sure you want to logout? This will stop the bot and disconnect all sessions.')) {
+                                            const response = await logout();
+                                            enqueueSnackbar(response.message || 'Bot stopped - Logout successful', {
+                                                variant: 'success',
+                                                autoHideDuration: 3000
+                                            });
+                                            setTimeout(() => {
+                                                window.location.href = 'http://localhost:3001/';
+                                            }, 1500);
+                                        }
+                                    } catch (error) {
+                                        enqueueSnackbar(error.message || 'Logout completed with errors', {
+                                            variant: 'warning',
+                                            autoHideDuration: 3000
+                                        });
+                                        setTimeout(() => {
+                                            window.location.href = 'http://localhost:3001/';
+                                        }, 2000);
+                                    }
+                                }}
+                                style={{
+                                    background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
+                                    color: 'white',
+                                    border: 'none',
+                                    padding: '8px 16px',
+                                    borderRadius: '6px',
+                                    cursor: 'pointer',
+                                    fontWeight: 'bold'
+                                }}
+                            >
+                                Logout
+                            </button>
+                        </Box>
                     </Box>
                     <Grid container spacing={2}>
                         <Grid item xs={12} md={4} container direction="column" spacing={2} wrap="nowrap">

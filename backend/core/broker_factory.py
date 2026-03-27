@@ -74,6 +74,23 @@ if BROKER_NAME == "kotak":
         else:
             print(f"[ERROR] Kotak login failed: {data}")
 
+    def clear_access_token():
+        """Clear the access token and invalidate the Kotak session for logout."""
+        global access_token
+        access_token = None
+
+        # Clear all session fields on the broker instance
+        try:
+            _kotak_instance._session_token = None
+            _kotak_instance._session_sid = None
+            _kotak_instance._base_url = None
+            _kotak_instance._access_token = ""
+            print("[OK] Kotak session cleared for logout")
+        except Exception as e:
+            print(f"[WARNING] Could not clear Kotak session fields: {e}")
+
+        print("[OK] Access token cleared for logout")
+
     def create_ticker(strategy_instance, main_loop):
         """Create a KotakTicker for real-time market data."""
         from .kotak_ticker import KotakTicker

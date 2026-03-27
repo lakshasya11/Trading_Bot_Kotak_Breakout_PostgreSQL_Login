@@ -1,0 +1,19 @@
+# Sensitive
+.env
+*.env
+users.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+package-lock.json
+
+# DB
+*.db
+
+# OS
+.DS_Store
+Thumbs.db

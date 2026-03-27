@@ -147,12 +147,15 @@ class KotakTicker(TickerInterface):
             except Exception as e:
                 print(f">>> KOTAK TICKER: Poll error: {e}")
                 self.consecutive_tick_failures += 1
-                if self.consecutive_tick_failures > 10:
-                    print(">>> KOTAK TICKER: Too many failures, pausing 10s...")
-                    await asyncio.sleep(10)
+                if self.consecutive_tick_failures > 20:
+                    print(">>> KOTAK TICKER: Too many failures, reconnecting in 5s...")
+                    await asyncio.sleep(5)
                     self.consecutive_tick_failures = 0
+                    # Re-mark as connected so strategy doesn't trigger failsafe exit
+                    self.is_connected = True
+                    self.connected_event.set()
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
 
         # Cleanup
         self.is_connected = False

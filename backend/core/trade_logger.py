@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from .database import today_engine, all_engine, sql_text
 
@@ -32,6 +33,8 @@ class TradeLogger:
         Creates/updates tables if they don't exist and clears the 'today'
         database if it's a new day.
         """
+        from .database import BASE_DIR, today_engine, all_engine
+        
         create_table_sql = sql_text('''
             CREATE TABLE IF NOT EXISTS trades (
                 id SERIAL PRIMARY KEY,
@@ -89,31 +92,26 @@ class TradeLogger:
                     ('entry_slippage', 'REAL'),
                     ('exit_slippage', 'REAL'),
                     ('latency_ms', 'INTEGER'),
-                    ('trading_mode', 'TEXT'),  # Track Paper vs Live
-                    # CONFIRMATORY momentum checks (lagging indicators)
-                    ('momentum_price_rising', 'INTEGER'),  # 0/1 for False/True
-                    ('momentum_accelerating', 'INTEGER'),  # 0/1 for False/True
-                    ('momentum_index_sync', 'INTEGER'),  # 0/1 for False/True
-                    ('momentum_volume_surge', 'INTEGER'),  # 0/1 for False/True
-                    ('momentum_checks_passed', 'INTEGER'),  # Confirmatory checks passed (0-3)
-                    # PREDICTIVE momentum checks (leading indicators)
-                    ('predictive_order_flow', 'INTEGER'),  # 0/1 - Order Flow Bullish
-                    ('predictive_divergence', 'INTEGER'),  # 0/1 - Positive Divergence
-                    ('predictive_structure', 'INTEGER'),  # 0/1 - Structure Break
-                    ('predictive_checks_passed', 'INTEGER'),  # Predictive checks passed (0-3)
-                    ('trigger_system', 'TEXT'),  # Which system triggered: PREDICTIVE, CONFIRMATORY, BOTH, NONE
-                    # 🆕 Entry/Exit Type Tracking
-                    ('entry_type', 'TEXT'),  # NO_WICK_BYPASS, TREND_CONTINUATION, SUPERTREND_ENTRY
-                    ('supertrend_hold_mode', 'TEXT'),  # TRENDING, FLAT, None
-                    ('entry_option_st_state', 'TEXT'),  # UPTREND, DOWNTREND, None (option supertrend at entry)
-                    ('exit_supertrend_reason', 'TEXT'),  # OPTION, INDEX, ENTRY_PRICE_HIT, etc.
-                    # 🆕 Exit Mode Tracking
-                    ('exit_mode', 'TEXT'),  # Standard or Aggressive Hold
-                    ('direction', 'TEXT'),  # CE or PE
-                    # 🆕 Candle Data Tracking
-                    ('candle_open_price', 'REAL'),  # Candle open price at entry
-                    # 🆕 User Tracking
-                    ('user_name', 'TEXT'),
+                    ('trading_mode', 'TEXT'),
+                    ('momentum_price_rising', 'INTEGER'),
+                    ('momentum_accelerating', 'INTEGER'),
+                    ('momentum_index_sync', 'INTEGER'),
+                    ('momentum_volume_surge', 'INTEGER'),
+                    ('momentum_checks_passed', 'INTEGER'),
+                    ('predictive_order_flow', 'INTEGER'),
+                    ('predictive_divergence', 'INTEGER'),
+                    ('predictive_structure', 'INTEGER'),
+                    ('predictive_checks_passed', 'INTEGER'),
+                    ('trigger_system', 'TEXT'),
+                    ('entry_type', 'TEXT'),
+                    ('supertrend_hold_mode', 'TEXT'),
+                    ('entry_option_st_state', 'TEXT'),
+                    ('exit_supertrend_reason', 'TEXT'),
+                    ('exit_mode', 'TEXT'),
+                    ('direction', 'TEXT'),
+                    ('candle_open_price', 'REAL'),
+                    ('candle_close_price', 'REAL'),
+                    ('user_name', 'TEXT')
                 ]
                 
                 for col_name, col_type in new_columns:
@@ -127,22 +125,19 @@ class TradeLogger:
         upgrade_schema(today_engine)
         upgrade_schema(all_engine)
         
+        last_run_file = os.path.join(BASE_DIR, "last_run_date.txt")
         try:
-            with open("last_run_date.txt", "r") as f: last_run_date = f.read()
+            with open(last_run_file, "r") as f: last_run_date = f.read()
         except FileNotFoundError: last_run_date = ""
 
         today_date = datetime.now().strftime("%Y-%m-%d")
         
         if last_run_date != today_date:
             print(f"New day detected. Clearing today's trade log...")
-            # --- THIS IS THE CORRECTED LOGIC ---
-            # It now ONLY clears the today_engine.
             with today_engine.begin() as conn:
                 conn.execute(sql_text("DELETE FROM trades"))
             
-            # The incorrect block that cleared all_engine has been REMOVED.
-            
-            with open("last_run_date.txt", "w") as f: f.write(today_date)
+            with open(last_run_file, "w") as f: f.write(today_date)
             print("Today's trade log cleared.")
 
         print("Databases setup complete.")

@@ -23,18 +23,38 @@ wheels/
 .installed.cfg
 *.egg
 
-# Trading Bot Specific
+# Sensitive / Credentials
+.env
+*.env
+broker_config.json
 access_token*.json
 user_profiles.json
+users.json
+
+# Trading Bot Specific
 strategy_params.json
 *.db
 trading_data*.db
 last_run_date.txt
-.env
-backend/broker_config.json
-users.json
-backend/ml_model.pkl
-frontend/.env
+*.pkl
+
+# Junk / Temp files
+r.txt
+test_out.txt
+tick_rate_analysis.txt
+login_error.html
+*.tmp
+temp/
+
+# Logs
+*.log
+logs/
+trading_log.txt
+
+# Frontend
+node_modules/
+dist/
+package-lock.json
 
 # IDE
 .vscode/
@@ -46,12 +66,3 @@ frontend/.env
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-logs/
-trading_log.txt
-
-# Temporary files
-*.tmp
-temp/

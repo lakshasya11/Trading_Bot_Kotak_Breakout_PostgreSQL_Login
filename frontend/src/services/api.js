@@ -59,3 +59,4 @@ export const getTradeHistory = () => apiRequest('/trade_history');
 export const getTradeHistoryAll = () => apiRequest('/trade_history_all');
 
 export const resetUoaWatchlist = () => apiRequest('/reset_uoa_watchlist', { method: 'POST' });
+export const logout = () => apiRequest('/logout', { method: 'POST' });

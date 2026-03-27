@@ -81,22 +81,11 @@ export default function AnalyticsPanel({ scope = 'all', viewType = 'trades' }) {
     const allTimeTradeHistory = useStore(state => state.allTimeTradeHistory);
     const tradesToAnalyze = scope === 'today' ? tradeHistory : allTimeTradeHistory;
 
-    // ✅ DEBUG: Log trade data at render time
-    console.log(`📊 AnalyticsPanel RENDER:`, {
-        scope,
-        tradeHistoryLength: tradeHistory?.length || 0,
-        allTimeLength: allTimeTradeHistory?.length || 0,
-        tradesToAnalyzeLength: tradesToAnalyze?.length || 0,
-        tradesToAnalyze: tradesToAnalyze,
-        isArray: Array.isArray(tradesToAnalyze)
-    });
-
-    // CRITICAL FIX: Call all hooks BEFORE any conditional returns
-    // Memoize based on trade count and last trade to avoid unnecessary recalculations
+    // Memoize based on trade count and newest trade (index 0, since addTradeToHistory prepends)
     const tradeHash = useMemo(() => {
         if (!tradesToAnalyze || tradesToAnalyze.length === 0) return '0';
-        const lastTrade = tradesToAnalyze[tradesToAnalyze.length - 1];
-        return `${tradesToAnalyze.length}-${lastTrade?.timestamp || ''}-${lastTrade?.net_pnl || ''}`;
+        const newestTrade = tradesToAnalyze[0];
+        return `${tradesToAnalyze.length}-${newestTrade?.timestamp || ''}-${newestTrade?.net_pnl || ''}`;
     }, [tradesToAnalyze]);
 
     const stats = useMemo(() => {
@@ -192,7 +181,8 @@ export default function AnalyticsPanel({ scope = 'all', viewType = 'trades' }) {
             console.error('Error calculating trade statistics:', error);
             return null;
         }
-    }, [tradeHash]); // Use tradeHash instead of entire array for better performance
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tradeHash, tradesToAnalyze]); // tradesToAnalyze needed to avoid stale closure
 
     // CRITICAL FIX: Conditional returns AFTER all hooks are called
     // Add safety check for undefined or null
@@ -224,8 +214,6 @@ export default function AnalyticsPanel({ scope = 'all', viewType = 'trades' }) {
             </Box>
         );
     }
-
-    console.log(`📊 AnalyticsPanel rendering: ${tradesToAnalyze.length} trades for scope "${scope}", viewType "${viewType}"`);
 
     if (!stats) return <Typography sx={{ p: 2 }}>No trade data found for this period.</Typography>;
 
