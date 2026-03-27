@@ -156,11 +156,68 @@ def require_auth():
         )
     return True
 
+async def _daily_summary_scheduler():
+    """Background task: sends daily summary email at 3:31 PM every trading day."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=15, minute=31, second=0, microsecond=0)
+        if now >= target:
+            target = target.replace(day=target.day + 1)
+        await asyncio.sleep((target - now).total_seconds())
+
+        try:
+            import json as _json
+            import pandas as pd
+            from core.email_notifier import EmailNotifier
+
+            with open("broker_config.json", "r") as f:
+                cfg = _json.load(f)
+
+            client_id = cfg.get("kotak_ucc", "")
+            name = cfg.get("kotak_user_name", "Trader")
+            mode = "LIVE"
+
+            # Read today's trades
+            from core.database import today_engine
+            with today_engine.connect() as conn:
+                df = pd.read_sql_query("SELECT * FROM trades", conn)
+
+            trades_list = df.to_dict("records") if not df.empty else []
+            total_trades = len(trades_list)
+            net_pnl = float(df["net_pnl"].sum()) if not df.empty and "net_pnl" in df.columns else 0.0
+            wins = int((df["net_pnl"] > 0).sum()) if not df.empty and "net_pnl" in df.columns else 0
+            losses = total_trades - wins
+
+            # Detect mode from trades
+            if not df.empty and "trading_mode" in df.columns:
+                mode = "LIVE" if "Live" in str(df["trading_mode"].iloc[0]) else "PAPER"
+
+            EmailNotifier.send_daily_summary(
+                client_id=client_id,
+                name=name,
+                kite_id=client_id,
+                mode=mode,
+                total_trades=total_trades,
+                net_pnl=net_pnl,
+                date=datetime.now().strftime("%Y-%m-%d"),
+                wins=wins,
+                losses=losses,
+                trades=trades_list
+            )
+            print("[DailySummary] Email sent successfully at 3:31 PM")
+        except Exception as e:
+            print(f"[DailySummary] Failed to send email: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Application startup...")
     TradeLogger.setup_databases()
-    
+
+    # Start daily summary scheduler
+    asyncio.create_task(_daily_summary_scheduler())
+    print("[OK] Daily summary scheduler started (fires at 3:31 PM)")
+
     # Reset bot state on startup
     service = await get_bot_service()
     service.is_running = False
