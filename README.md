@@ -24,7 +24,7 @@ Trading_Bot_Kotak_Breakout/
 - 🛡️ Risk management & trailing stop-loss
 - 📈 Live React dashboard with candlestick charts, option chain, P&L tracking
 - 🔔 Audio & visual trade alerts
-- 🗃️ SQLite trade logging & analytics
+- 🗃️ PostgreSQL trade logging & analytics
 
 ---
 
@@ -34,7 +34,7 @@ Trading_Bot_Kotak_Breakout/
 |----------|-------------------------------------------|
 | Backend  | Python, FastAPI, Uvicorn, KiteConnect     |
 | Frontend | React 18, Vite, Material-UI, TradingView  |
-| Database | SQLite                                    |
+| Database | PostgreSQL                                |
 | Broker   | Kotak Neo API                             |
 
 ---
@@ -52,8 +52,13 @@ pip install -r requirements.txt
 
 Create a `.env` file in `backend/`:
 ```env
-API_KEY=your_kotak_api_key
-API_SECRET=your_kotak_api_secret
+DB_HOST=your_db_host
+DB_PORT=5432
+DB_USER=your_db_user
+DB_PASSWORD=your_db_password
+DB_NAME_TODAY=trading_kotak_today
+DB_NAME_ALL=trading_kotak_all
+API_KEY=your_api_key
 ```
 
 Run:
@@ -84,6 +89,7 @@ STOP_EVERYTHING.bat    ← stops everything
 ## ⚠️ Important
 
 - Never commit `.env`, `broker_config.json`, `strategy_params.json`, or `*.db` files
+- PostgreSQL credentials must never be hardcoded — always use `.env`
 - All sensitive files are listed in `.gitignore`
 
 ---
