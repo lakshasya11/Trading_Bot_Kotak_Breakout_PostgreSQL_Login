@@ -217,6 +217,16 @@ class TradingBotService:
             
             try:
                 main_loop = asyncio.get_running_loop()
+
+                # Re-login if Kotak session expired
+                from core.broker_factory import broker as _broker, BROKER_NAME as _bn
+                if _bn == "kotak" and not _broker.is_logged_in:
+                    print("[BotService] Kotak session expired — re-logging in...")
+                    await asyncio.to_thread(_broker.generate_session)
+                    if not _broker.is_logged_in:
+                        raise Exception("Kotak re-login failed. Check broker_config.json credentials.")
+                    print("[BotService] Kotak re-login successful.")
+
                 self.strategy_instance = Strategy(params=params, manager=manager, selected_index=selected_index)
                 
                 # CRITICAL FIX: Reload instruments (async call, already loaded in __init__ but refresh here)

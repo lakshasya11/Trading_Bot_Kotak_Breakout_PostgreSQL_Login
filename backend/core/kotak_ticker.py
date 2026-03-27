@@ -175,8 +175,16 @@ class KotakTicker(TickerInterface):
         self.manual_stop = False
 
         if not self._broker.is_logged_in:
-            print(">>> KOTAK TICKER: Broker not logged in! Cannot start.")
-            return
+            print(">>> KOTAK TICKER: Broker not logged in — attempting auto re-login...")
+            try:
+                self._broker.generate_session()
+                if not self._broker.is_logged_in:
+                    print(">>> KOTAK TICKER: Re-login failed. Cannot start.")
+                    return
+                print(">>> KOTAK TICKER: Re-login successful.")
+            except Exception as e:
+                print(f">>> KOTAK TICKER: Re-login error: {e}")
+                return
 
         # Schedule polling coroutine
         self._poll_task = asyncio.run_coroutine_threadsafe(
