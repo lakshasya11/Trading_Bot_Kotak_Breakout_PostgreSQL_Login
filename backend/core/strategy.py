@@ -117,6 +117,19 @@ class Strategy:
     def __init__(self, params, manager: ConnectionManager, selected_index="SENSEX"):
         self.params = self._sanitize_params(params)
         self.manager = manager
+        
+        # 🔥 MULTI-USER TRACKING: Load active user name for DB logging
+        self.user_name = "System"
+        try:
+            import os
+            import json
+            config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "broker_config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self.user_name = config.get("kotak_user_name", "Unknown Kotak User")
+        except Exception as e:
+            print(f"⚠️ Error loading user name for strategy: {e}")
         self.ticker_manager: Optional["KiteTickerManager"] = None
         self.config = INDEX_CONFIG[selected_index]
         self.ui_update_task: Optional[asyncio.Task] = None
@@ -4917,6 +4930,7 @@ class Strategy:
             log_info = { 
                 "timestamp": exit_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"), 
                 "trigger_reason": p.get("trigger_reason", reason), 
+                "user_name": self.user_name,
                 "symbol": p["symbol"], 
                 "quantity": p["qty"], 
                 "pnl": _final_pnl, 
@@ -5711,6 +5725,7 @@ class Strategy:
             log_info = {
                 "timestamp": exit_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"),
                 "trigger_reason": p["trigger_reason"],
+                "user_name": self.user_name,
                 "symbol": p["symbol"],
                 "quantity": qty_to_exit,
                 "pnl": round(gross_pnl, 2),

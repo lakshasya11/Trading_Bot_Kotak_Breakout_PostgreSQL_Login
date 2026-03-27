@@ -287,8 +287,13 @@ async def authenticate(token_request: TokenRequest):
 async def get_trade_history():
     def db_call():
         try:
+            # 🔥 MULTI-USER FILTERING: Only show trades for the current active user
+            user_info = _get_active_user_info()
+            active_user_name = user_info.get("name", "Unknown")
+            
             with today_engine.connect() as conn:
-                df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
+                query = "SELECT * FROM trades WHERE (user_name = :user OR user_name IS NULL) ORDER BY timestamp ASC"
+                df = pd.read_sql_query(sql_text(query), conn, params={"user": active_user_name})
                 
                 # Manual cleanup to avoid pandas weakref serialization bugs
                 import numpy as np
@@ -347,10 +352,13 @@ async def get_performance(service: TradingBotService = Depends(get_bot_service))
                 from core.database import TODAY_DB_PATH
                 if not os.path.exists(TODAY_DB_PATH): return None
                 
+                # MULTI-USER FILTERING
+                user_info = _get_active_user_info()
+                active_user_name = user_info.get("name", "Unknown")
+                
                 with sqlite3.connect(TODAY_DB_PATH) as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
-                    # Filter by today's trading mode if needed (default to Paper for summary)
                     cursor.execute("""
                         SELECT 
                             SUM(pnl) as grossPnl, 
@@ -360,7 +368,8 @@ async def get_performance(service: TradingBotService = Depends(get_bot_service))
                             SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
                             SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses
                         FROM trades
-                    """)
+                        WHERE (user_name = ? OR user_name IS NULL)
+                    """, (active_user_name,))
                     row = cursor.fetchone()
                     if row and row['trades_today'] > 0:
                         return {
