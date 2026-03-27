@@ -43,6 +43,11 @@ r.txt
 test_out.txt
 tick_rate_analysis.txt
 login_error.html
+App.minimal.jsx
+App.test.jsx
+*-sound-test.html
+soundtest.html
+test-sounds.html
 *.tmp
 temp/
 
