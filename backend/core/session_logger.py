@@ -88,7 +88,7 @@ class SessionLogger:
             "client_id": signup_client_id or client_id,
             "kite_id": client_id,
             "username": login_username,    # Login Username
-            "kite_username": name,         # Zerodha Name
+            "kite_username": name,         # Kotak Name
             "session_date": date.isoformat(),
             "login_time": login_time.isoformat(),
             "mode": mode,
@@ -236,7 +236,7 @@ class SessionLogger:
                     "client_id": session.signup_client_id or session.client_id,
                     "kite_id": session.client_id,
                     "username": login_username,    # Login Username
-                    "kite_username": session.name, # Zerodha Name
+                    "kite_username": session.name, # Kotak Name
                     "session_date": session.login_time.date().isoformat(),
                     "login_time": session.login_time.isoformat(),
                     "logout_time": logout_time.isoformat(),

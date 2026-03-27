@@ -11,7 +11,7 @@ class TradingBotService:
 
     def __init__(self):
         self.strategy_instance: Strategy | None = None
-        self.ticker_manager_instance = None  # TickerInterface (Kite or Kotak)
+        self.ticker_manager_instance = None  # TickerInterface (Kotak)
         self.uoa_scanner_task: asyncio.Task | None = None
         self.continuous_monitor_task: asyncio.Task | None = None
         self.position_health_monitor_task: asyncio.Task | None = None  # 🔥 NEW: Position tick health monitor
@@ -309,7 +309,7 @@ class TradingBotService:
                         print("  2. Network/Firewall issue")
                     else:
                         print("  1. Zerodha WebSocket server is down")
-                        print("  2. Network/Firewall blocking ws.kite.trade")
+                        print("  2. Network/Firewall issue")
                     print("  3. Multiple connections from same account")
                     print("  4. Antivirus blocking WebSocket connections")
                     print("")

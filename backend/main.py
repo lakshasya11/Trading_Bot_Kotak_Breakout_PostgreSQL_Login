@@ -60,7 +60,7 @@ def _socket_init_wrapper(original_socket_init):
 
 socket.socket.__init__ = _socket_init_wrapper(socket.socket.__init__)
 
-from core.broker_factory import broker as kite, generate_session_and_set_token, access_token, BROKER_NAME
+from core.broker_factory import broker, generate_session_and_set_token, access_token, BROKER_NAME
 from core.websocket_manager import manager
 from core.strategy import MARKET_STANDARD_PARAMS
 from core.optimiser import OptimizerBot
@@ -88,7 +88,7 @@ def _send_bot_stop_email(reason: str = "Bot Stopped"):
 
 
 def _get_active_user_info() -> dict:
-    """Get active user info from broker config (Kotak) or user_profiles.json (Kite)."""
+    """Get active user info from broker config (Kotak)."""
     if BROKER_NAME == "kotak":
         try:
             with open("broker_config.json", "r") as f:
@@ -238,7 +238,7 @@ async def lifespan(app: FastAPI):
     if current_token:
         try:
             print("Reconciling open positions...")
-            positions = await kite.positions()  # Fixed: kite.positions() is already async
+            positions = await broker.positions()
             net_positions = positions.get('net', [])
             open_mis_positions = [
                 p['tradingsymbol'] for p in net_positions 
@@ -285,9 +285,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[Email] Shutdown session report error: {e}")
     
-    # Mark kite as shutting down
-    if hasattr(kite, 'shutdown'):
-        await kite.shutdown()
+    # Mark broker as shutting down
+    if hasattr(broker, 'shutdown'):
+        await broker.shutdown()
     
     print("Shutdown tasks complete.")
 
@@ -349,8 +349,8 @@ async def db_viewer():
 
 @app.get("/login")
 async def login():
-    """Redirects to Kite login page."""
-    return RedirectResponse(url=kite.login_url())
+    """Redirects to Kotak login page."""
+    return RedirectResponse(url=broker.login_url())
 
 
 class TokenRequest(BaseModel): request_token: str
@@ -364,16 +364,12 @@ async def get_status():
     if current_token:
         try:
             # Actively VERIFY the token by making a network API call.
-            profile = await kite.profile()  # Fixed: kite.profile() is already async
-            # If the call succeeds, we are truly authenticated.
+            profile = await broker.profile()
             return {"status": "authenticated", "user": profile.get('user_id')}
         except Exception:
-            # If kite.profile() fails, it means the token is invalid.
-            # We catch the error and fall through to the unauthenticated response.
             pass
     
-    # This is the fallback for BOTH "no token" and "invalid token" cases.
-    return {"status": "unauthenticated", "login_url": kite.login_url()}
+    return {"status": "unauthenticated", "login_url": broker.login_url()}
 
 @app.get("/api/diagnostics")
 async def get_diagnostics(auth=Depends(require_auth)):
@@ -755,7 +751,7 @@ async def get_available_expiries(index_name: str, service: TradingBotService = D
             raise HTTPException(status_code=400, detail=f"Invalid index: {index_name}")
         
         from datetime import date
-        from core.broker_factory import broker as kite
+        from core.broker_factory import broker
         import asyncio
         
         # Determine exchange
@@ -791,7 +787,7 @@ async def get_available_expiries(index_name: str, service: TradingBotService = D
             # Strategy 2: Fetch fresh from Kite API with extended timeout
             try:
                 instruments = await asyncio.wait_for(
-                    kite.instruments(exchange),
+                    broker.instruments(exchange),
                     timeout=45.0  # Extended timeout for initial load
                 )
                 
@@ -1013,8 +1009,8 @@ async def logout(service: TradingBotService = Depends(get_bot_service)):
 
         # 2. Call Kotak logout API to invalidate session server-side
         try:
-            if hasattr(kite, 'logout'):
-                await kite.logout()
+            if hasattr(broker, 'logout'):
+                await broker.logout()
                 print("[OK] Kotak session invalidated")
         except Exception as e:
             print(f"[WARNING] Kotak logout API error: {e}")
