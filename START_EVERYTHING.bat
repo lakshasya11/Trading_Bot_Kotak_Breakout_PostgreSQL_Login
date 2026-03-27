@@ -18,6 +18,18 @@ echo.
 echo ============================================================================
 echo.
 
+REM Start login server on port 5001
+echo [INFO] Starting login server on port 5001...
+if exist "backend\venv\Scripts\activate.bat" (
+    start "Trading Bot - Login Server" cmd /k "cd /d %~dp0login\server && ..\..ackend\venv\Scripts\activate.bat && python app.py"
+) else (
+    start "Trading Bot - Login Server" cmd /k "cd /d %~dp0login\server && python app.py"
+)
+
+REM Wait for login server to start
+echo [INFO] Waiting for login server to start (3 seconds)...
+timeout /t 3 /nobreak >nul
+
 REM Start backend in its own window
 echo [INFO] Starting backend server with Kotak auto-login...
 if exist "backend\venv\Scripts\activate.bat" (
@@ -51,7 +63,9 @@ echo ===========================================================================
 echo.
 echo Backend:  http://localhost:8000  (Trading Engine + API)
 echo Frontend: http://localhost:5173  (Web Interface)
+echo Login:    http://localhost:5001  (Login Server)
 echo.
+echo [OK] Login server window opened - Auth server on port 5001
 echo [OK] Backend window opened  - Trading engine with auto-login
 echo [OK] Frontend window opened - Web UI server
 echo [OK] Browser opened         - http://localhost:5173
