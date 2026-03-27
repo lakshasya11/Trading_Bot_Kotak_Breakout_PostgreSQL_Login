@@ -10,7 +10,7 @@ from datetime import datetime
 import os
 import time
 from collections import defaultdict
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, FileResponse
 import socket
 import logging
 import sys
@@ -294,6 +294,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/db_viewer.html")
+async def db_viewer():
+    """Serve the DB Viewer HTML page."""
+    html_path = os.path.join(os.path.dirname(__file__), "db_viewer.html")
+    return FileResponse(html_path, media_type="text/html")
 
 
 @app.get("/login")

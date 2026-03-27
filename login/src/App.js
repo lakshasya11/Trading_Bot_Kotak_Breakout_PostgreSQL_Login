@@ -616,7 +616,7 @@ function App() {
     <div className={`container page-transition ${!showSplash ? 'slide-open' : ''}`}>
       {/* DB Viewer Button */}
       <button
-        onClick={() => window.open('http://localhost:5001/', '_blank')}
+        onClick={() => window.open('http://localhost:8000/db_viewer.html', '_blank')}
         style={{
           position: 'fixed',
           top: '20px',

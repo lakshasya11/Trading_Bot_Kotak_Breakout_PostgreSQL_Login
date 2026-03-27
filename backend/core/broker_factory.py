@@ -38,6 +38,12 @@ def _load_broker_config() -> dict:
 _broker_config = _load_broker_config()
 BROKER_NAME: str = _broker_config.get("broker", "kite").lower().strip()
 
+# Flatten active user config into top-level for brokers that use nested users
+_active_user = _broker_config.get("active_user")
+if _active_user and "users" in _broker_config:
+    _user_config = _broker_config["users"].get(_active_user, {})
+    _broker_config = {**_broker_config, **_user_config}
+
 print(f"[BROKER FACTORY] Active broker: {BROKER_NAME}")
 
 # ── Initialise the correct broker ───────────────────────────────────────
