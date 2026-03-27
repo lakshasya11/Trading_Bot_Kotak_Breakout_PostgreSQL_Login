@@ -296,6 +296,43 @@ app.add_middleware(
 )
 
 
+@app.get("/api/sessions")
+async def get_sessions(show_all: bool = False):
+    """Get bot sessions for db_viewer — today only or all history"""
+    def db_call():
+        try:
+            from core.database import today_engine, all_engine
+            engine = all_engine if show_all else today_engine
+            with engine.connect() as conn:
+                result = conn.execute(sql_text("""
+                    SELECT date, login_time, logout_time, mode,
+                           COALESCE(total_trades,0) as total_trades,
+                           COALESCE(wins,0) as wins,
+                           COALESCE(losses,0) as losses,
+                           COALESCE(pnl,0) as pnl
+                    FROM bot_sessions
+                    ORDER BY login_time DESC
+                """))
+                rows = result.mappings().fetchall()
+                return [
+                    {
+                        "date": str(r["date"]) if r["date"] else "",
+                        "login_time": str(r["login_time"]) if r["login_time"] else "",
+                        "logout_time": str(r["logout_time"]) if r["logout_time"] else "",
+                        "mode": r["mode"] or "PAPER",
+                        "total_trades": r["total_trades"],
+                        "wins": r["wins"],
+                        "losses": r["losses"],
+                        "pnl": float(r["pnl"])
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            print(f"[Sessions] Error: {e}")
+            return []
+    return await asyncio.to_thread(db_call)
+
+
 @app.get("/db_viewer.html")
 async def db_viewer():
     """Serve the DB Viewer HTML page."""
