@@ -636,28 +636,6 @@ function App() {
         📊 DB Viewer
       </button>
 
-      {/* Logout Button */}
-      <button
-        onClick={handleLogout}
-        style={{
-          position: 'fixed',
-          top: '20px',
-          left: '20px',
-          background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
-          color: 'white',
-          border: 'none',
-          padding: '10px 20px',
-          borderRadius: '25px',
-          cursor: 'pointer',
-          fontWeight: 'bold',
-          fontSize: '14px',
-          zIndex: 1000,
-          boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
-        }}
-      >
-        🚪 Logout
-      </button>
-
       {/* Galaxy Background */}
       <div className="galaxy-container"></div>
 
