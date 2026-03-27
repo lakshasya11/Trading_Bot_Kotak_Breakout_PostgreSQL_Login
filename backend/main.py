@@ -168,7 +168,12 @@ async def _daily_summary_scheduler():
         try:
             import json as _json
             import pandas as pd
+            from dotenv import load_dotenv
             from core.email_notifier import EmailNotifier
+
+            # Ensure login/server/.env is loaded for NOTIFICATION_EMAIL & SMTP settings
+            _env_path = os.path.join(os.path.dirname(__file__), '..', 'login', 'server', '.env')
+            load_dotenv(os.path.normpath(_env_path), override=True)
 
             with open("broker_config.json", "r") as f:
                 cfg = _json.load(f)
@@ -176,6 +181,10 @@ async def _daily_summary_scheduler():
             client_id = cfg.get("kotak_ucc", "")
             name = cfg.get("kotak_user_name", "Trader")
             mode = "LIVE"
+
+            # Use kotak_email as fallback if NOTIFICATION_EMAIL not set
+            if not os.getenv("NOTIFICATION_EMAIL") and cfg.get("kotak_email"):
+                os.environ["NOTIFICATION_EMAIL"] = cfg["kotak_email"]
 
             # Read today's trades
             from core.database import today_engine
