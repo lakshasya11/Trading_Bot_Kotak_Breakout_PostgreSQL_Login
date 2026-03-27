@@ -32,7 +32,7 @@ Trading_Bot_Kotak_Breakout/
 
 | Layer    | Tech                                      |
 |----------|-------------------------------------------|
-| Backend  | Python, FastAPI, Uvicorn, KiteConnect     |
+| Backend  | Python, FastAPI, Uvicorn, Kotak Neo API   |
 | Frontend | React 18, Vite, Material-UI, TradingView  |
 | Database | PostgreSQL                                |
 | Broker   | Kotak Neo API                             |
