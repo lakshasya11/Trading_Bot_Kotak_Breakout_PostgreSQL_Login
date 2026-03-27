@@ -1,3 +1,6 @@
+# Broker credentials (NEVER commit)
+broker_config.json
+
 # Virtual Environment
 venv/
 

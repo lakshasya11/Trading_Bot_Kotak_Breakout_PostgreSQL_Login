@@ -46,7 +46,18 @@ class TradeLogger:
                 trend_state TEXT,
                 atr REAL,
                 charges REAL,
-                net_pnl REAL
+                net_pnl REAL,
+                entry_time TEXT,
+                exit_time TEXT,
+                duration_seconds REAL,
+                max_price REAL,
+                signal_time TEXT,
+                order_time TEXT,
+                expected_entry REAL,
+                expected_exit REAL,
+                entry_slippage REAL,
+                exit_slippage REAL,
+                latency_ms INTEGER
             )
         ''')
         
@@ -55,10 +66,52 @@ class TradeLogger:
                 conn.execute(create_table_sql)
                 cursor = conn.execute(sql_text("PRAGMA table_info(trades);"))
                 columns = [row[1] for row in cursor]
-                if 'charges' not in columns:
-                    conn.execute(sql_text("ALTER TABLE trades ADD COLUMN charges REAL;"))
-                if 'net_pnl' not in columns:
-                    conn.execute(sql_text("ALTER TABLE trades ADD COLUMN net_pnl REAL;"))
+                
+                # Add missing columns if they don't exist
+                new_columns = [
+                    ('charges', 'REAL'),
+                    ('net_pnl', 'REAL'),
+                    ('entry_time', 'TEXT'),
+                    ('exit_time', 'TEXT'),
+                    ('duration_seconds', 'REAL'),
+                    ('max_price', 'REAL'),
+                    ('signal_time', 'TEXT'),
+                    ('order_time', 'TEXT'),
+                    ('expected_entry', 'REAL'),
+                    ('expected_exit', 'REAL'),
+                    ('entry_slippage', 'REAL'),
+                    ('exit_slippage', 'REAL'),
+                    ('latency_ms', 'INTEGER'),
+                    ('trading_mode', 'TEXT'),  # Track Paper vs Live
+                    # CONFIRMATORY momentum checks (lagging indicators)
+                    ('momentum_price_rising', 'INTEGER'),  # 0/1 for False/True
+                    ('momentum_accelerating', 'INTEGER'),  # 0/1 for False/True
+                    ('momentum_index_sync', 'INTEGER'),  # 0/1 for False/True
+                    ('momentum_volume_surge', 'INTEGER'),  # 0/1 for False/True
+                    ('momentum_checks_passed', 'INTEGER'),  # Confirmatory checks passed (0-3)
+                    # PREDICTIVE momentum checks (leading indicators)
+                    ('predictive_order_flow', 'INTEGER'),  # 0/1 - Order Flow Bullish
+                    ('predictive_divergence', 'INTEGER'),  # 0/1 - Positive Divergence
+                    ('predictive_structure', 'INTEGER'),  # 0/1 - Structure Break
+                    ('predictive_checks_passed', 'INTEGER'),  # Predictive checks passed (0-3)
+                    ('trigger_system', 'TEXT'),  # Which system triggered: PREDICTIVE, CONFIRMATORY, BOTH, NONE
+                    # 🆕 Entry/Exit Type Tracking
+                    ('entry_type', 'TEXT'),  # NO_WICK_BYPASS, TREND_CONTINUATION, SUPERTREND_ENTRY
+                    ('supertrend_hold_mode', 'TEXT'),  # TRENDING, FLAT, None
+                    ('entry_option_st_state', 'TEXT'),  # UPTREND, DOWNTREND, None (option supertrend at entry)
+                    ('exit_supertrend_reason', 'TEXT'),  # OPTION, INDEX, ENTRY_PRICE_HIT, etc.
+                    # 🆕 Exit Mode Tracking
+                    ('exit_mode', 'TEXT'),  # Standard or Aggressive Hold
+                    ('direction', 'TEXT'),  # CE or PE
+                    # 🆕 Candle Data Tracking
+                    ('candle_open_price', 'REAL'),  # Candle open price at entry
+                    ('candle_close_price', 'REAL')  # Candle close price at exit
+                ]
+                
+                for col_name, col_type in new_columns:
+                    if col_name not in columns:
+                        conn.execute(sql_text(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type};"))
+                
                 if hasattr(conn, 'commit'): conn.commit() 
 
         upgrade_schema(today_engine)

@@ -8,8 +8,59 @@ from pydantic import BaseModel
 import uvicorn
 from datetime import datetime
 import os
+import time
+from collections import defaultdict
+from fastapi.responses import RedirectResponse
+import socket
+import logging
+import sys
 
-from core.kite import kite, generate_session_and_set_token, access_token
+# ===== WINDOWS UTF-8 ENCODING FIX =====
+# Configure UTF-8 encoding for console output to handle emojis
+if sys.platform == 'win32':
+    try:
+        import codecs
+        if hasattr(sys.stdout, 'buffer'):
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'replace')
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'replace')
+        else:
+            # Already wrapped or redirected (e.g., with Tee-Object)
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception as e:
+        # Fallback: continue without UTF-8 reconfiguration
+        print(f"[WARN] Could not configure UTF-8 encoding: {e}")
+
+# ===== LOGGING SETUP =====
+# Configure logging to display debug logs in console AND save to file
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s - %(name)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Console output
+        logging.FileHandler('bot_debug.log', mode='a', encoding='utf-8')  # File output with UTF-8
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.info("="*80)
+logger.info("BOT STARTING - Debug logging enabled (console + bot_debug.log file)")
+logger.info("="*80)
+
+# ===== WINDOWS SOCKET COMPATIBILITY FIX =====
+# Enable SO_REUSEADDR globally to handle lingering TIME_WAIT connections on Windows
+def _socket_init_wrapper(original_socket_init):
+    def new_init(self, *args, **kwargs):
+        original_socket_init(self, *args, **kwargs)
+        # Enable address reuse for Windows compatibility
+        try:
+            self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except (OSError, AttributeError):
+            pass
+    return new_init
+
+socket.socket.__init__ = _socket_init_wrapper(socket.socket.__init__)
+
+from core.broker_factory import broker as kite, generate_session_and_set_token, access_token, BROKER_NAME
 from core.websocket_manager import manager
 from core.strategy import MARKET_STANDARD_PARAMS
 from core.optimiser import OptimizerBot
@@ -17,19 +68,88 @@ from core.trade_logger import TradeLogger
 from core.bot_service import TradingBotService, get_bot_service
 from core.database import today_engine, all_engine
 
+# ===== COOLDOWN MECHANISM =====
+last_request_times = defaultdict(float)
+
+
+def _get_active_user_info() -> dict:
+    """Get active user info from broker config (Kotak) or user_profiles.json (Kite)."""
+    if BROKER_NAME == "kotak":
+        try:
+            with open("broker_config.json", "r") as f:
+                cfg = json.load(f)
+            return {
+                "id": cfg.get("kotak_ucc", "kotak"),
+                "name": cfg.get("kotak_user_name", "Kotak User"),
+                "description": "Kotak Neo Trading Account",
+            }
+        except Exception:
+            return {"id": "kotak", "name": "Kotak User", "description": ""}
+    else:
+        try:
+            with open("user_profiles.json", "r") as f:
+                data = json.load(f)
+            active_id = data.get("active_user", "")
+            user = next(
+                (u for u in data.get("users", []) if u["id"] == active_id),
+                None,
+            )
+            if user:
+                return {
+                    "id": user["id"],
+                    "name": user["name"],
+                    "description": user.get("description", ""),
+                }
+        except Exception:
+            pass
+        return {"id": "unknown", "name": "User", "description": ""}
+
+
+def cooldown_check(endpoint: str, cooldown_seconds: float = 1.0):
+    """
+    Prevent rapid-fire requests to same endpoint.
+    Protects against button spam and accidental double-clicks.
+    """
+    now = time.time()
+    last_time = last_request_times[endpoint]
+    
+    if now - last_time < cooldown_seconds:
+        remaining = cooldown_seconds - (now - last_time)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait {remaining:.1f} seconds before retrying"
+        )
+    
+    last_request_times[endpoint] = now
+
+# ===== AUTHENTICATION DEPENDENCY =====
+def require_auth():
+    """Dependency to ensure user is authenticated before trading operations"""
+    from core.broker_factory import access_token  # Import at runtime to get current value
+    if not access_token:
+        raise HTTPException(
+            status_code=401, 
+            detail="Authentication required. Please authenticate at /api/authenticate first."
+        )
+    return True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Application startup...")
     TradeLogger.setup_databases()
+    
+    # Reset bot state on startup
+    service = await get_bot_service()
+    service.is_running = False
+    print("[OK] Bot ready (is_running = False)")
 
     # --- ADDED: Open Position Reconciliation Logic ---
-    # Small delay to ensure WebSocket manager is ready for potential connections
-    await asyncio.sleep(2)
-    if access_token:
+    # No delay needed - WebSocket manager is ready at this point
+    from core.broker_factory import access_token as current_token
+    if current_token:
         try:
             print("Reconciling open positions...")
-            positions = await asyncio.to_thread(kite.positions)
+            positions = await kite.positions()  # Fixed: kite.positions() is already async
             net_positions = positions.get('net', [])
             open_mis_positions = [
                 p['tradingsymbol'] for p in net_positions 
@@ -46,28 +166,50 @@ async def lifespan(app: FastAPI):
                         "message": warning_message
                     }
                 })
+            else:
+                print("[OK] No open MIS positions found")
         except Exception as e:
-            print(f"Could not reconcile open positions: {e}")
+            print(f"[INFO] Could not reconcile open positions (token may be invalid): {e}")
+    else:
+        print("[INFO] No access token - skipping position reconciliation")
     # --- END OF ADDED LOGIC ---
 
     yield
     print("Application shutdown...")
+    
+    # Stop bot if running
     service = await get_bot_service()
     if service.ticker_manager_instance:
-        await service.stop_bot()
+        try:
+            await asyncio.wait_for(service.stop_bot(), timeout=15.0)
+        except asyncio.TimeoutError:
+            print("Bot shutdown timed out")
+        except Exception as e:
+            print(f"Error during bot shutdown: {e}")
+    
+    # Mark kite as shutting down
+    if hasattr(kite, 'shutdown'):
+        await kite.shutdown()
+    
     print("Shutdown tasks complete.")
 
 app = FastAPI(lifespan=lifespan)
 
-
-
+# Add CORS middleware immediately after app creation
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # This is the key change
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/login")
+async def login():
+    """Redirects to Kite login page."""
+    return RedirectResponse(url=kite.login_url())
+
 
 class TokenRequest(BaseModel): request_token: str
 class StartRequest(BaseModel): params: dict; selectedIndex: str
@@ -76,10 +218,11 @@ class WatchlistRequest(BaseModel): side: str; strike: int
 @app.get("/api/status")
 async def get_status():
     # Check if the global access_token variable exists first
-    if access_token:
+    from core.broker_factory import access_token as current_token
+    if current_token:
         try:
             # Actively VERIFY the token by making a network API call.
-            profile = await asyncio.to_thread(kite.profile)
+            profile = await kite.profile()  # Fixed: kite.profile() is already async
             # If the call succeeds, we are truly authenticated.
             return {"status": "authenticated", "user": profile.get('user_id')}
         except Exception:
@@ -89,6 +232,49 @@ async def get_status():
     
     # This is the fallback for BOTH "no token" and "invalid token" cases.
     return {"status": "unauthenticated", "login_url": kite.login_url()}
+
+@app.get("/api/diagnostics")
+async def get_diagnostics(auth=Depends(require_auth)):
+    """🔍 Diagnostic endpoint to check bot health and instrument status"""
+    service = await get_bot_service()
+    
+    if not service.strategy_instance:
+        return {
+            "bot_running": False,
+            "error": "Bot not started yet"
+        }
+    
+    strategy = service.strategy_instance
+    
+    diagnostics = {
+        "bot_running": service.is_running,
+        "instruments_loaded": len(strategy.option_instruments),
+        "last_used_expiry": str(strategy.last_used_expiry) if strategy.last_used_expiry else None,
+        "initial_subscription_done": strategy.initial_subscription_done,
+        "index_symbol": strategy.index_symbol,
+        "index_price": strategy.data_manager.prices.get(strategy.index_symbol),
+        "token_to_symbol_count": len(strategy.token_to_symbol),
+        "lot_size": strategy.lot_size,
+        "freeze_limit": strategy.freeze_limit,
+        "strike_step": strategy.strike_step,
+        "has_position": strategy.position is not None,
+        "websocket_connected": service.ticker_manager_instance is not None and 
+                              hasattr(service.ticker_manager_instance, 'ws') and 
+                              service.ticker_manager_instance.ws is not None,
+    }
+    
+    # Check if we can get strike pairs
+    try:
+        pairs = strategy.get_strike_pairs(count=3)
+        diagnostics["strike_pairs_available"] = len(pairs)
+        if pairs:
+            diagnostics["sample_strike"] = pairs[0]["strike"]
+            diagnostics["sample_ce_symbol"] = pairs[0]["ce"]["tradingsymbol"] if pairs[0]["ce"] else None
+            diagnostics["sample_pe_symbol"] = pairs[0]["pe"]["tradingsymbol"] if pairs[0]["pe"] else None
+    except Exception as e:
+        diagnostics["strike_pairs_error"] = str(e)
+    
+    return diagnostics
 
 @app.post("/api/authenticate")
 async def authenticate(token_request: TokenRequest):
@@ -103,9 +289,13 @@ async def get_trade_history():
         try:
             with today_engine.connect() as conn:
                 df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
+                # Replace NaN values with None (which serializes to null in JSON)
+                df = df.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
                 return df.to_dict('records')
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch today's trade history: {e}")
+            # Return empty list instead of error if table doesn't exist or is empty
+            print(f"[WARNING] Trade history fetch: {e}")
+            return []
     return await asyncio.to_thread(db_call)
 
 @app.get("/api/trade_history_all")
@@ -114,46 +304,31 @@ async def get_all_trade_history():
         try:
             with all_engine.connect() as conn:
                 df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
+                # Replace NaN values with None (which serializes to null in JSON)
+                df = df.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
                 return df.to_dict('records')
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch all trade history: {e}")
+            # Return empty list instead of error if table doesn't exist or is empty
+            print(f"⚠️ All-time trade history fetch: {e}")
+            return []
     return await asyncio.to_thread(db_call)
 
-@app.get("/api/chart_data")
-async def get_chart_data(service: TradingBotService = Depends(get_bot_service)):
-    """Get historical chart data with indicators for testing."""
-    if not service.strategy_instance or not service.strategy_instance.data_manager:
-        return {"data": [], "message": "No strategy instance or data manager"}
-    
-    temp_df = service.strategy_instance.data_manager.data_df.copy()
-    if temp_df.empty:
-        return {"data": [], "message": "No historical data available"}
-    
-    chart_data = []
-    for index, row in temp_df.iterrows():
-        timestamp = int(index.timestamp())
-        point = {
-            "timestamp": timestamp,
-            "time": timestamp,
-            "open": row.get("open", 0),
-            "high": row.get("high", 0), 
-            "low": row.get("low", 0),
-            "close": row.get("close", 0)
+@app.get("/api/performance")
+async def get_performance(service: TradingBotService = Depends(get_bot_service)):
+    """Get current daily performance stats (useful for manual refresh)"""
+    if service.strategy_instance:
+        trades_today = service.strategy_instance.performance_stats["winning_trades"] + service.strategy_instance.performance_stats["losing_trades"]
+        return {
+            "grossPnl": service.strategy_instance.daily_gross_pnl,
+            "totalCharges": service.strategy_instance.total_charges,
+            "netPnl": service.strategy_instance.daily_net_pnl,
+            "net_pnl": service.strategy_instance.daily_net_pnl,  # Add snake_case alias for status bar
+            "wins": service.strategy_instance.performance_stats["winning_trades"],
+            "losses": service.strategy_instance.performance_stats["losing_trades"],
+            "trades_today": trades_today
         }
-        
-        # Add indicators if available
-        if 'supertrend' in row and pd.notna(row.get('supertrend')):
-            point['supertrend'] = float(row['supertrend'])
-        if 'supertrend_uptrend' in row and pd.notna(row.get('supertrend_uptrend')):
-            point['supertrend_uptrend'] = bool(row['supertrend_uptrend'])
-            
-        rsi_col = f"RSI_{service.strategy_instance.params.get('rsi_period', 14)}"
-        if rsi_col in row and pd.notna(row.get(rsi_col)):
-            point['rsi'] = float(row[rsi_col])
-            
-        chart_data.append(point)
-    
-    return {"data": chart_data, "count": len(chart_data)}
+    else:
+        return {"grossPnl": 0, "totalCharges": 0, "netPnl": 0, "net_pnl": 0, "wins": 0, "losses": 0, "trades_today": 0}
 
 @app.post("/api/optimize")
 async def run_optimizer(service: TradingBotService = Depends(get_bot_service)):
@@ -176,114 +351,426 @@ async def reset_uoa(service: TradingBotService = Depends(get_bot_service)):
     return {"status": "success", "message": "UOA Watchlist has been cleared."}
 
 # --- THIS IS THE CORRECTED FUNCTION ---
-@app.post("/api/reset_params")
-async def reset_params(service: TradingBotService = Depends(get_bot_service)):
-    try:
-        with open("strategy_params.json", "w") as f:
-            json.dump(MARKET_STANDARD_PARAMS, f, indent=4)
-        
-        if service.strategy_instance:
-            await service.strategy_instance.reload_params()
-        
-        return {"status": "success", "message": "Parameters reset to market standards."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reset parameters: {str(e)}")
-
 @app.post("/api/update_strategy_params")
-async def update_strategy_params(request: dict, service: TradingBotService = Depends(get_bot_service)):
-    """Update strategy parameters from frontend"""
+async def update_strategy_parameters(params: dict, service: TradingBotService = Depends(get_bot_service)):
     try:
-        # Load current strategy params
+        # CRITICAL FIX: Merge with existing params to preserve technical indicators
         try:
             with open("strategy_params.json", "r") as f:
-                current_params = json.load(f)
+                existing_params = json.load(f)
         except FileNotFoundError:
-            current_params = MARKET_STANDARD_PARAMS.copy()
+            existing_params = MARKET_STANDARD_PARAMS.copy()
         
-        # Update only Supertrend parameters if provided
-        supertrend_params = ['supertrend_period', 'supertrend_multiplier']
-        updated = False
-        for param in supertrend_params:
-            if param in request and request[param] is not None:
-                # Convert to appropriate type
-                if param == 'supertrend_period':
-                    current_params[param] = int(request[param])
-                else:  # supertrend_multiplier
-                    current_params[param] = float(request[param])
-                updated = True
+        # Merge: Preserve existing technical params, update only what's sent from UI
+        merged_params = {**MARKET_STANDARD_PARAMS, **existing_params, **params}
         
-        if updated:
-            # Save updated parameters
-            with open("strategy_params.json", "w") as f:
-                json.dump(current_params, f, indent=4)
+        # Step 1: Update the JSON file with merged parameters
+        with open("strategy_params.json", "w") as f:
+            json.dump(merged_params, f, indent=4)
+        
+        # Step 2: If the bot is running, tell it to reload its parameters from the file
+        if service.strategy_instance:
+            await service.strategy_instance.reload_params()
+            await service.strategy_instance._log_debug("System", "Parameters have been updated from UI.")
             
-            # Reload in running strategy if active
-            if service.strategy_instance:
-                await service.strategy_instance.reload_params()
-            
-            return {"status": "success", "message": "Supertrend parameters updated successfully."}
-        else:
-            return {"status": "success", "message": "No parameters to update."}
-            
+        return {"status": "success", "message": "Parameters updated successfully.", "params": merged_params}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update parameters: {str(e)}")
 
+@app.post("/api/reset_params")
+async def reset_parameters(service: TradingBotService = Depends(get_bot_service)):
+    try:
+        # Step 1: Overwrite the JSON file with the market standard defaults.
+        with open("strategy_params.json", "w") as f:
+            json.dump(MARKET_STANDARD_PARAMS, f, indent=4)
+        
+        # Step 2: If the bot is running, tell it to reload its parameters from the file.
+        if service.strategy_instance:
+            await service.strategy_instance.reload_params()
+            await service.strategy_instance._log_debug("System", "Parameters have been reset to market defaults.")
+            
+        return {"status": "success", "message": "Parameters reset.", "params": MARKET_STANDARD_PARAMS}
+    except Exception as e:
+        # The str(e) is included for better debugging if something else goes wrong.
+        raise HTTPException(status_code=500, detail=f"Failed to reset parameters: {str(e)}")
+
 @app.post("/api/start")
-async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_bot_service)):
+async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
+    cooldown_check("start", cooldown_seconds=2.0)
     return await service.start_bot(req.params, req.selectedIndex)
 
 @app.post("/api/stop")
-async def stop_bot(service: TradingBotService = Depends(get_bot_service)):
+async def stop_bot(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
+    cooldown_check("stop", cooldown_seconds=1.0)
     return await service.stop_bot()
 
 @app.post("/api/pause")
-async def pause_bot(service: TradingBotService = Depends(get_bot_service)):
+async def pause_bot(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
+    cooldown_check("pause", cooldown_seconds=1.0)
     return await service.pause_bot()
 
 @app.post("/api/unpause")
-async def unpause_bot(service: TradingBotService = Depends(get_bot_service)):
+async def unpause_bot(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
+    cooldown_check("unpause", cooldown_seconds=1.0)
     return await service.unpause_bot()
 
 @app.post("/api/manual_exit")
-async def manual_exit_trade(service: TradingBotService = Depends(get_bot_service)):
+async def manual_exit(service: TradingBotService = Depends(get_bot_service), authenticated: bool = Depends(require_auth)):
+    cooldown_check("manual_exit", cooldown_seconds=3.0)
     return await service.manual_exit_trade()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, service: TradingBotService = Depends(get_bot_service)):
+    conn_start_time = asyncio.get_event_loop().time()
     await manager.connect(websocket)
     print("Client connected. Synchronizing state...")
+    
     try:
+        # Send active user info immediately
+        try:
+            active_user_info = _get_active_user_info()
+            await websocket.send_json({
+                "type": "active_user_update",
+                "payload": active_user_info
+            })
+        except Exception:
+            pass
+
+        # Send initial state synchronization
         if service.strategy_instance:
             await service.strategy_instance._update_ui_status()
+            # CRITICAL FIX: Always send performance data even if zero (ensures UI shows correct state)
             await service.strategy_instance._update_ui_performance()
             await service.strategy_instance._update_ui_trade_status()
             print("State synchronization complete.")
         else:
-             await manager.broadcast({"type": "status_update", "payload": {
-                "connection": "DISCONNECTED", "mode": "NOT STARTED", "is_running": False,
-                "indexPrice": 0, "trend": "---", "indexName": "INDEX"
-            }})
+            # Send initial state to this specific connection (not broadcast)
+            try:
+                await websocket.send_json({"type": "status_update", "payload": {
+                    "connection": "DISCONNECTED", "mode": "NOT STARTED", "is_running": False,
+                    "indexPrice": 0, "trend": "---", "indexName": "INDEX"
+                }})
+                print("Initial state sent to new client.")
+            except Exception as send_err:
+                print(f"[WARNING] Failed to send initial state: {send_err}")
 
+        # Main message loop
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            try:
+                # Set a longer timeout to accommodate trade execution (which can take 1-2 seconds)
+                # Plus some buffer for network delays
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=300.0)
+                message = json.loads(data)
+                
+                if message.get("type") == "ping":
+                    # Update ping metadata
+                    manager.update_ping_metadata(websocket)
+                    # Send pong response
+                    await websocket.send_text('{"type": "pong"}')
+                    continue
+                
+                if message.get("type") == "add_to_watchlist":
+                    payload = message.get("payload", {})
+                    if service.strategy_instance:
+                        await service.strategy_instance.add_to_watchlist(payload.get("side"), payload.get("strike"))
             
-            if message.get("type") == "ping":
-                await websocket.send_text('{"type": "pong"}')
+            except asyncio.TimeoutError:
+                # No message received for 300 seconds - send a ping to check if client is alive
+                try:
+                    await asyncio.wait_for(websocket.send_text('{"type": "ping"}'), timeout=5.0)
+                except asyncio.TimeoutError:
+                    print("[WARNING] Ping send timeout, closing connection")
+                    break
+                except Exception:
+                    # If we can't send ping, connection is dead
+                    print("⚠️ Failed to send ping, closing connection")
+                    break
+            except json.JSONDecodeError as e:
+                print(f"[WARNING] Invalid JSON received: {e}")
                 continue
-            
-            if message.get("type") == "add_to_watchlist":
-                payload = message.get("payload", {})
-                if service.strategy_instance:
-                    await service.strategy_instance.add_to_watchlist(payload.get("side"), payload.get("strike"))
     
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        print("Client disconnected.")
+        duration = asyncio.get_event_loop().time() - conn_start_time
+        print(f"WebSocket disconnected normally (duration: {duration:.1f}s)")
+        await manager.disconnect(websocket)
+    except RuntimeError as e:
+        if "not connected" in str(e).lower():
+            print(f"WebSocket closed by client")
+        else:
+            print(f"⚠️ WebSocket runtime error: {e}")
+        await manager.disconnect(websocket)
     except Exception as e:
-        print(f"Error in websocket endpoint: {e}")
-        if websocket.client_state != 3: # STATE_DISCONNECTED
-             manager.disconnect(websocket)
+        duration = asyncio.get_event_loop().time() - conn_start_time
+        print(f"❌ Error in websocket endpoint (duration: {duration:.1f}s): {e}")
+        await manager.disconnect(websocket)
+
+# ===== OPTION EXPIRY ENDPOINTS =====
+@app.get("/api/expiries/{index_name}")
+async def get_available_expiries(index_name: str, service: TradingBotService = Depends(get_bot_service)):
+    """Get all available expiries for the selected index"""
+    try:
+        # Validate index name
+        if index_name not in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+            raise HTTPException(status_code=400, detail=f"Invalid index: {index_name}")
+        
+        from datetime import date
+        from core.broker_factory import broker as kite
+        import asyncio
+        
+        # Determine exchange
+        exchange = "NFO" if index_name in ["NIFTY", "BANKNIFTY"] else "BFO"
+        
+        try:
+            # Strategy 1: Try to use cached instruments from running strategy instance
+            if service.strategy_instance and hasattr(service.strategy_instance, 'option_instruments'):
+                instruments = service.strategy_instance.option_instruments
+                
+                # If loaded instruments are for a different index, we need to fetch fresh
+                if instruments and len(instruments) > 0:
+                    first_inst_index = instruments[0].get('name', '')
+                    if first_inst_index == index_name:
+                        # We can use these cached instruments
+                        today = date.today()
+                        expiries = set()
+                        
+                        for inst in instruments:
+                            if inst.get('expiry') and inst['expiry'] >= today:
+                                expiries.add(inst['expiry'])
+                        
+                        sorted_expiries = sorted(list(expiries))
+                        formatted_expiries = [exp.strftime('%Y-%m-%d') for exp in sorted_expiries]
+                        
+                        return {
+                            "index": index_name,
+                            "expiries": formatted_expiries,
+                            "count": len(formatted_expiries),
+                            "source": "cached"
+                        }
+            
+            # Strategy 2: Fetch fresh from Kite API with extended timeout
+            try:
+                instruments = await asyncio.wait_for(
+                    kite.instruments(exchange),
+                    timeout=45.0  # Extended timeout for initial load
+                )
+                
+                # Filter for the selected index and get unique expiries
+                today = date.today()
+                expiries = set()
+                
+                for inst in instruments:
+                    if inst['name'] == index_name and inst.get('expiry'):
+                        expiry_date = inst['expiry']
+                        # Only include future expiries
+                        if expiry_date >= today:
+                            expiries.add(expiry_date)
+                
+                # Sort expiries and format as strings
+                sorted_expiries = sorted(list(expiries))
+                formatted_expiries = [exp.strftime('%Y-%m-%d') for exp in sorted_expiries]
+                
+                return {
+                    "index": index_name,
+                    "expiries": formatted_expiries,
+                    "count": len(formatted_expiries),
+                    "source": "fresh"
+                }
+                
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Instrument loading timed out. This can happen when the broker API is slow. Try starting the bot first (it caches instruments) or try again in a moment."
+                )
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {str(e)}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting expiries: {str(e)}")
+
+# ===== USER MANAGEMENT ENDPOINTS =====
+@app.get("/api/users")
+async def get_users():
+    """Get list of all users (without sensitive credentials)"""
+    if BROKER_NAME == "kotak":
+        try:
+            with open("broker_config.json", "r") as f:
+                cfg = json.load(f)
+            labels = ["Primary", "Secondary", "Tertiary", "Quaternary"]
+            kotak_users = cfg.get("kotak_users", [])
+            # Fallback: single-user config
+            if not kotak_users:
+                kotak_users = [{
+                    "id": "user1",
+                    "name": cfg.get("kotak_user_name", "Kotak User"),
+                    "ucc": cfg.get("kotak_ucc", ""),
+                    "description": "Primary account"
+                }]
+            users = [
+                {
+                    "id": u["id"],
+                    "name": u["name"],
+                    "description": labels[i] + " account" if i < len(labels) else f"Account {i+1}"
+                }
+                for i, u in enumerate(kotak_users)
+            ]
+            return {
+                "users": users,
+                "active_user": cfg.get("kotak_active_user", "user1")
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error loading Kotak users: {str(e)}")
+    else:
+        try:
+            with open("user_profiles.json", "r") as f:
+                data = json.load(f)
+            users = [
+                {
+                    "id": u["id"],
+                    "name": u["name"],
+                    "description": u.get("description", "")
+                }
+                for u in data.get("users", [])
+            ]
+            return {
+                "users": users,
+                "active_user": data.get("active_user")
+            }
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="user_profiles.json not found.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error loading users: {str(e)}")
+
+@app.post("/api/users/switch/{user_id}")
+async def switch_user(user_id: str):
+    """Switch to a different user (requires bot restart to apply)"""
+    cooldown_check("user_switch", cooldown_seconds=2.0)
+    if BROKER_NAME == "kotak":
+        try:
+            with open("broker_config.json", "r") as f:
+                cfg = json.load(f)
+            kotak_users = cfg.get("kotak_users", [])
+            user = next((u for u in kotak_users if u["id"] == user_id), None)
+            if not user:
+                raise HTTPException(status_code=404, detail=f"Kotak user '{user_id}' not found in broker_config.json")
+            # Switch active user and load that user's credentials into top-level config
+            cfg["kotak_active_user"] = user_id
+            cfg["kotak_ucc"] = user.get("ucc", cfg.get("kotak_ucc", ""))
+            cfg["kotak_mobile"] = user.get("mobile", cfg.get("kotak_mobile", ""))
+            cfg["kotak_totp_secret"] = user.get("totp_secret", cfg.get("kotak_totp_secret", ""))
+            cfg["kotak_mpin"] = user.get("mpin", cfg.get("kotak_mpin", ""))
+            cfg["kotak_user_name"] = user.get("name", cfg.get("kotak_user_name", ""))
+            with open("broker_config.json", "w") as f:
+                json.dump(cfg, f, indent=4)
+            return {
+                "success": True,
+                "message": f"Switched to Kotak user: {user['name']}",
+                "active_user": user_id,
+                "restart_required": True
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error switching Kotak user: {str(e)}")
+    else:
+        try:
+            with open("user_profiles.json", "r") as f:
+                data = json.load(f)
+            user_exists = any(u["id"] == user_id for u in data.get("users", []))
+            if not user_exists:
+                raise HTTPException(status_code=404, detail=f"User '{user_id}' not found in user_profiles.json")
+            user = next((u for u in data["users"] if u["id"] == user_id), None)
+            user_name = user["name"] if user else user_id
+            data["active_user"] = user_id
+            with open("user_profiles.json", "w") as f:
+                json.dump(data, f, indent=2)
+            return {
+                "success": True,
+                "message": f"User switched to: {user_name}",
+                "active_user": user_id,
+                "restart_required": True
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error switching user: {str(e)}")
+
+@app.get("/api/users/active")
+async def get_active_user():
+    """Get details of currently active user"""
+    try:
+        with open("user_profiles.json", "r") as f:
+            data = json.load(f)
+        
+        active_user_id = data.get("active_user")
+        users = data.get("users", [])
+        
+        active_user = next((u for u in users if u["id"] == active_user_id), None)
+        
+        if not active_user:
+            raise HTTPException(status_code=404, detail="Active user not found in user_profiles.json")
+        
+        # Return without sensitive credentials
+        return {
+            "id": active_user["id"],
+            "name": active_user["name"],
+            "description": active_user.get("description", "")
+        }
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="user_profiles.json not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting active user: {str(e)}")
+
+# ===== KILL SWITCH STATUS ENDPOINT =====
+@app.get("/api/kill_switch_status")
+async def get_kill_switch_status():
+    """Get current kill switch status for monitoring system health"""
+    from core.kill_switch import kill_switch
+    return kill_switch.get_status()
+
+@app.post("/api/kill_switch_reset")
+async def reset_kill_switch():
+    """Manually reset the kill switch (use after fixing the underlying issue)"""
+    from core.kill_switch import kill_switch
+    kill_switch.manual_reset()
+    return {"success": True, "message": "Kill switch has been manually reset"}
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    import sys
+    import signal
+    
+    # Prevent FastAPI from reading stdin which causes premature exit
+    sys.stdin = open(os.devnull, 'r')
+    
+    # Add signal handlers to prevent unexpected shutdown
+    def signal_handler(signum, frame):
+        print(f"\n[DEBUG] Received signal {signum}")
+        if signum == signal.SIGINT:
+            print("[INFO] Ctrl+C pressed, shutting down...")
+            sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, signal_handler)
+    
+    print("[DEBUG] Starting Uvicorn server...")
+    try:
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=8000,
+            reload=False,
+            access_log=True
+        )
+    except KeyboardInterrupt:
+        print("[INFO] Server stopped by user")
+    except Exception as e:
+        print(f"[ERROR] Server crashed: {e}")
+        import traceback
+        traceback.print_exc()

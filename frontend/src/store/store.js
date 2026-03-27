@@ -13,6 +13,10 @@ const initialRealtimeState = {
     optionChain: [],
     uoaList: [],
     straddleData: null,
+    premiumVelocity: {},  // 💰 NEW: {symbol: {currentVelocity, pctVelocity, acceleration, trend, velocityMa, ...}}
+    trendData: null,  // 📊 Trend direction scout: {atm_strike, ce_option, pe_option, recommendation, confidence}
+    expiryInfo: null,  // 📅 Expiry information: {available_expiries, selected_expiry_type, current_expiry}
+    activeUser: null,  // 👤 Active user: {id, name, description}
     socketStatus: 'DISCONNECTED',
 };
 
@@ -22,16 +26,18 @@ const createParametersSlice = (set) => ({
     loadParams: () => {
         const savedParams = localStorage.getItem('tradingParams');
         const defaultParams = {
-            selectedIndex: 'SENSEX', trading_mode: 'Paper Trading',
-            start_capital: 50000, risk_per_trade_percent: 2.0, trailing_sl_points: 5, 
+            selectedIndex: 'NIFTY', option_expiry_type: '', trading_mode: 'Paper Trading',
+            start_capital: 50000, trailing_sl_points: 5, 
             trailing_sl_percent: 2.5, daily_sl: -20000, daily_pt: 40000, 
-            trade_profit_target: 1000, break_even_percent: 5, partial_profit_pct: 3, partial_exit_pct: 30, auto_scan_uoa: false,
+            trade_profit_target: 1000, break_even_threshold_pct: 2.0, partial_profit_pct: 3, partial_exit_pct: 30, auto_scan_uoa: false,
+            green_candle_hold_enabled: false, green_hold_min_profit_pct: 1.0, green_hold_max_loss_pct: -2.0,
             supertrend_period: 5, supertrend_multiplier: 0.7,
+            // REMOVED: stop_loss and profit_target - using Trailing SL (points/%) and Trade PT instead
             // REMOVED: Recovery and Max Lots are no longer needed here as they are not used in the simplified logic
             // recovery_threshold_pct: 2.0, 
             // max_lots_per_order: 1800
         };
-        set({ params: savedParams ? JSON.parse(savedParams) : defaultParams });
+        set({ params: savedParams ? { ...defaultParams, ...JSON.parse(savedParams) } : defaultParams });
     },
     setParams: (newParams) => {
         localStorage.setItem('tradingParams', JSON.stringify(newParams));
@@ -50,8 +56,14 @@ const createRealtimeDataSlice = (set) => ({
     resetRealtimeData: () => set(initialRealtimeState),
     isSpectatorMode: spectatorFlag,
     setSocketStatus: (status) => set({ socketStatus: status }),
-    setTradeHistory: (history) => set({ tradeHistory: history }),
-    setAllTimeTradeHistory: (history) => set({ allTimeTradeHistory: history }),
+    setTradeHistory: (history) => {
+        console.log('📝 Setting tradeHistory:', history?.length || 0, 'trades');
+        set({ tradeHistory: Array.isArray(history) ? history : [] });
+    },
+    setAllTimeTradeHistory: (history) => {
+        console.log('📝 Setting allTimeTradeHistory:', history?.length || 0, 'trades');
+        set({ allTimeTradeHistory: Array.isArray(history) ? history : [] });
+    },
     updateBotStatus: (payload) => set({ botStatus: payload }),
     updateDailyPerformance: (payload) => set({ dailyPerformance: payload }),
     updateCurrentTrade: (payload) => set({ currentTrade: payload }),
@@ -60,10 +72,54 @@ const createRealtimeDataSlice = (set) => ({
     updateUoaList: (payload) => set({ uoaList: payload }),
     updateChartData: (payload) => set({ chartData: payload }),
     updateStraddleData: (payload) => set({ straddleData: payload }),
-    addTradeToHistory: (trade) => set(state => ({ 
-        tradeHistory: [trade, ...state.tradeHistory],
-        allTimeTradeHistory: [trade, ...state.allTimeTradeHistory]
+    updateTrendData: (payload) => set({ trendData: payload }),  // 📊 Trend direction update
+    updateExpiryInfo: (payload) => set({ expiryInfo: payload }),  // 📅 Expiry information update
+    updateActiveUser: (payload) => set({ activeUser: payload }),  // 👤 Active user update
+    addTradeToHistory: (trade) => set(state => {
+        console.log(`📊 STORE UPDATE: Adding trade to history:`, {
+            symbol: trade?.symbol,
+            pnl: trade?.net_pnl || trade?.pnl,
+            timestamp: trade?.timestamp,
+            totalTrades: (state.tradeHistory?.length || 0) + 1,
+            trade
+        });
+        return {
+            tradeHistory: [trade, ...state.tradeHistory],
+            allTimeTradeHistory: [trade, ...state.allTimeTradeHistory]
+        };
+    }),
+    updatePremiumVelocity: (payload) => set(state => ({
+        premiumVelocity: {
+            ...state.premiumVelocity,
+            [payload.symbol]: {
+                optionType: payload.option_type,              // ← NEW: CE or PE
+                atmStrike: payload.atm_strike,                // ← NEW: ATM strike price
+                currentVelocity: payload.current_velocity,
+                pctVelocity: payload.pct_velocity,
+                acceleration: payload.acceleration,
+                trend: payload.trend,
+                velocityMa: payload.velocity_ma,
+                indexVelocity: payload.index_velocity,
+                velocityRatio: payload.velocity_ratio,
+                signalType: payload.signal_type,
+                currentPrice: payload.current_price,
+                timestamp: payload.timestamp
+            }
+        }
     })),
+    clearPremiumVelocity: (payload) => set(state => {
+        // Keep only ATM symbols, remove all others
+        const atmSymbols = payload.atm_symbols || [];
+        const newVelocity = {};
+        
+        atmSymbols.forEach(symbol => {
+            if (state.premiumVelocity[symbol]) {
+                newVelocity[symbol] = state.premiumVelocity[symbol];
+            }
+        });
+        
+        return { premiumVelocity: newVelocity };
+    }),
 });
 
 export const useStore = create((...a) => ({

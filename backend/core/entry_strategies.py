@@ -1,599 +1,515 @@
-# backend/core/entry_strategies.py - V47.14 FULL IMPLEMENTATION
-from abc import ABC, abstractmethod
+# backend/core/entry_strategies.py
+import math
 import asyncio
 import pandas as pd
 import numpy as np
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
 # ==============================================================================
-# V47.14 FULL SYSTEM: ALL 4 ENTRY ENGINES + STRATEGY COORDINATOR
-# Complete implementation matching original V47.14 specification
+# SECTION 1: CANDLESTICK PATTERN HELPER FUNCTIONS
+# ==============================================================================
+
+def is_bullish_engulfing(prev, last):
+    if prev is None or last is None or pd.isna(prev['open']) or pd.isna(last['open']): return False
+    prev_body = abs(prev['close'] - prev['open'])
+    last_body = abs(last['close'] - last['open'])
+    return (prev['close'] < prev['open'] and last['close'] > last['open'] and
+            last['close'] > prev['open'] and last['open'] < prev['close'] and
+            last_body > prev_body * 0.8)
+
+def is_bearish_engulfing(prev, last):
+    if prev is None or last is None or pd.isna(prev['open']) or pd.isna(last['open']): return False
+    prev_body = abs(prev['close'] - prev['open'])
+    last_body = abs(last['close'] - last['open'])
+    return (prev['close'] > prev['open'] and last['close'] < last['open'] and
+            last['open'] > prev['close'] and last['close'] < prev['open'] and
+            last_body > prev_body * 0.8)
+
+def is_morning_star(c1, c2, c3):
+    if c1 is None or c2 is None or c3 is None or any(pd.isna(c['open']) for c in [c1, c2, c3]): return False
+    b1 = abs(c1['close'] - c1['open']); b2 = abs(c2['close'] - c2['open']); b3 = abs(c3['close'] - c3['open'])
+    return (c1['close'] < c1['open'] and b2 < b1 * 0.3 and c2['high'] < c1['close'] and 
+            c3['open'] > c2['high'] and c3['close'] > c3['open'] and b3 > b1 * 0.6)
+
+def is_evening_star(c1, c2, c3):
+    if c1 is None or c2 is None or c3 is None or any(pd.isna(c['open']) for c in [c1, c2, c3]): return False
+    b1 = abs(c1['close'] - c1['open']); b2 = abs(c2['close'] - c2['open']); b3 = abs(c3['close'] - c3['open'])
+    return (c1['close'] > c1['open'] and b2 < b1 * 0.3 and c2['low'] > c1['close'] and 
+            c3['open'] < c2['low'] and c3['close'] < c3['open'] and b3 > b1 * 0.6)
+
+def is_hammer(c):
+    if c is None or pd.isna(c['open']): return False
+    body = abs(c['close'] - c['open'])
+    if body == 0: return False
+    lower_wick = min(c['open'], c['close']) - c['low']
+    upper_wick = c['high'] - max(c['open'], c['close'])
+    price_range = c['high'] - c['low']
+    return (lower_wick > body * 2.5 and upper_wick < body * 0.5 and (min(c['open'], c['close']) - c['low']) > price_range * 0.6)
+
+def is_hanging_man(c):
+    return is_hammer(c)
+
+def is_doji(c, tol=0.05):
+    if c is None or pd.isna(c['open']): return False
+    body = abs(c['close'] - c['open']); rng = c['high'] - c['low']
+    if rng == 0: return False
+    return (body / rng) < tol
+
+# ==============================================================================
+# SECTION 2: BASE CLASS AND ALL ENTRY STRATEGIES
 # ==============================================================================
 
 class BaseEntryStrategy(ABC):
     def __init__(self, strategy_instance):
         self.strategy = strategy_instance
-        self.params = strategy_instance.params  
+        self.params = strategy_instance.params
         self.data_manager = strategy_instance.data_manager
 
     @abstractmethod
     async def check(self):
         pass
 
+    async def _validate_entry_conditions(self, side, opt):
+        if not opt: return False
+        symbol = opt['tradingsymbol']
+        strike = opt['strike']
+        
+        # --- NEW CONFORMATION: Option Price must be above its current 1-minute open (Green Candle) ---
+        option_candle = self.data_manager.option_candles.get(symbol)
+        current_price = self.data_manager.prices.get(symbol)
+        
+        if option_candle and 'open' in option_candle and current_price and current_price <= option_candle['open']:
+             await self.strategy._log_debug("Validation", f"REJECTED {symbol}: Option price {current_price} is not above its 1-min open {option_candle['open']}.")
+             return False
+        # --- END NEW CONFIRMATION ---
+        
+        # Late entry check REMOVED - Allow entries at any time during candle
+
+        if not self.data_manager.is_average_price_trending(symbol, 'up'):
+            return False
+
+        if not await self._is_opposite_falling(side, strike):
+            return False
+            
+        if not self._momentum_ok(side, symbol): return False
+        if not self._is_accelerating(symbol): return False
+        await self.strategy._log_debug("Validation", f"PASS: All entry conditions met for {symbol}.")
+        return True
+
+    async def _is_opposite_falling(self, side, strike):
+        opposite_side = 'PE' if side == 'CE' else 'CE'
+        opposite_opt = self.strategy.get_entry_option(opposite_side, strike)
+        if not opposite_opt: return True
+        
+        opposite_symbol = opposite_opt['tradingsymbol']
+        return self.data_manager.is_average_price_trending(opposite_symbol, 'down')
+
+    def _momentum_ok(self, side, opt_sym, look=20):
+        idx_prices = self.data_manager.price_history.get(self.strategy.index_symbol, [])
+        opt_prices = self.data_manager.price_history.get(opt_sym, [])
+        if len(idx_prices) < look or len(opt_prices) < look: return False
+        
+        # Get prices only, discard timestamps for this calculation
+        idx_price_values = [p for ts, p in idx_prices]
+        opt_price_values = [p for ts, p in opt_prices]
+
+        idx_up = sum(1 for i in range(1, look) if idx_price_values[-i] > idx_price_values[-i - 1])
+        opt_up = sum(1 for i in range(1, look) if opt_price_values[-i] > opt_price_values[-i - 1])
+        
+        if side == 'CE':
+            return idx_up >= 1 and opt_up >= 1
+        else: # PE
+            idx_dn = (look - 1) - idx_up
+            return idx_dn >= 1 and opt_up >= 1
+
+    def _is_accelerating(self, symbol, lookback_ticks=20, acceleration_factor=2.0):
+        history = self.data_manager.price_history.get(symbol, [])
+        if len(history) < lookback_ticks: return False
+        
+        # Get prices only from (timestamp, price) tuples
+        prices = [p for ts, p in history]
+
+        recent_prices = prices[-lookback_ticks:]
+        diffs = np.diff(recent_prices)
+        if len(diffs) < 2: return False
+
+        current_velocity = diffs[-1]
+        avg_velocity = np.mean(diffs[:-1])
+
+        if current_velocity <= 0: return False
+        if avg_velocity > 0 and current_velocity > avg_velocity * acceleration_factor:
+            return True
+            
+        return False
+
 # ==============================================================================
-# V47.14 ENTRY ENGINE 1: VOLATILITY BREAKOUT (HIGHEST PRIORITY)
+# DUAL-OPTION MONITOR STRATEGY (PRIORITY 1)
 # ==============================================================================
 
-class V47VolatilityBreakoutEngine(BaseEntryStrategy):
-    """V47.14 Entry Logic 1: Volatility Breakout - captures explosive moves"""
+class DualOptionMonitorStrategy(BaseEntryStrategy):
+    """
+    🎯 DUAL-OPTION MONITOR STRATEGY
     
-    async def check(self):
-        """Enhanced volatility breakout with frequency & quality improvements"""
-        df = self.data_manager.data_df
-        if len(df) < 10:  # Need sufficient history for quality analysis
-            return None, None, None
-            
-        current_price = self.data_manager.prices.get(self.strategy.index_symbol)
-        if not current_price:
-            return None, None, None
-
-        # === 1. OPTIONAL ATR SQUEEZE (BONUS POINTS) ===
-        atr_squeeze_bonus = 0
-        if await self.strategy._check_atr_squeeze():
-            atr_squeeze_bonus = 2  # Bonus points for ATR squeeze setup
-            
-        # === 2. DYNAMIC RANGE: 3-8 CANDLES BASED ON MARKET CONDITIONS ===
-        # Determine optimal range based on recent volatility
-        if 'atr' in df.columns and len(df) >= 20:
-            recent_atr = df['atr'].iloc[-5:].mean()
-            historical_atr = df['atr'].iloc[-20:].mean()
-            volatility_ratio = recent_atr / historical_atr if historical_atr > 0 else 1.0
-            
-            # Dynamic range selection
-            if volatility_ratio > 1.3:  # High volatility - use shorter range
-                range_periods = 3
-            elif volatility_ratio > 1.1:  # Medium volatility 
-                range_periods = 5
-            else:  # Low volatility - use longer range
-                range_periods = 8
-        else:
-            range_periods = 5  # Default fallback
-            
-        # Establish dynamic price range
-        recent_candles = df.iloc[-range_periods:]
-        range_high = recent_candles['high'].max()
-        range_low = recent_candles['low'].min()
-        range_size = range_high - range_low
-        
-        # === 5. ENHANCED BREAKOUT DETECTION WITH SIGNIFICANCE ===
-        last_candle = df.iloc[-1]
-        prev_candle = df.iloc[-2]
-        
-        # Calculate percentage breakout threshold (0.1-0.2% of price)
-        price_threshold = current_price * 0.0015  # 0.15% of current price
-        
-        # Get ATR for significance check
-        avg_atr = df['atr'].iloc[-10:].mean() if 'atr' in df.columns else range_size
-        min_breakout_size = max(price_threshold, avg_atr * 0.3)  # Minimum significance
-        
-        potential_breakouts = []
-        
-        # Enhanced Bullish Breakout Detection
-        if current_price > (range_high + min_breakout_size):
-            bull_score = 0
-            
-            # Basic breakout confirmed
-            bull_score += 1
-            
-            # === 5. VOLUME CONFIRMATION (IF AVAILABLE) ===
-            if 'volume' in df.columns and len(df) >= 10:
-                recent_volume = last_candle.get('volume', 0)
-                avg_volume = df['volume'].iloc[-10:-1].mean()
-                if recent_volume > avg_volume * 1.2:  # 20% volume surge
-                    bull_score += 1
-                    
-            # === 5. MOMENTUM CONFIRMATION ===
-            # Check for follow-through momentum
-            if (last_candle['close'] > last_candle['open'] and  # Green candle
-                last_candle['high'] > prev_candle['high']):     # Higher high
-                bull_score += 1
-                
-            # === 6. CANDLE BODY STRENGTH (AVOID WICKS) ===
-            body_size = abs(last_candle['close'] - last_candle['open'])
-            candle_range = last_candle['high'] - last_candle['low']
-            if candle_range > 0 and body_size > candle_range * 0.6:  # 60% body minimum
-                bull_score += 1
-                
-            potential_breakouts.append(('CE', bull_score))
-            
-        # Enhanced Bearish Breakout Detection  
-        if current_price < (range_low - min_breakout_size):
-            bear_score = 0
-            
-            # Basic breakout confirmed
-            bear_score += 1
-            
-            # === 5. VOLUME CONFIRMATION (IF AVAILABLE) ===
-            if 'volume' in df.columns and len(df) >= 10:
-                recent_volume = last_candle.get('volume', 0)
-                avg_volume = df['volume'].iloc[-10:-1].mean()
-                if recent_volume > avg_volume * 1.2:  # 20% volume surge
-                    bear_score += 1
-                    
-            # === 5. MOMENTUM CONFIRMATION ===
-            # Check for follow-through momentum
-            if (last_candle['close'] < last_candle['open'] and  # Red candle
-                last_candle['low'] < prev_candle['low']):       # Lower low
-                bear_score += 1
-                
-            # === 6. CANDLE BODY STRENGTH (AVOID WICKS) ===
-            body_size = abs(last_candle['close'] - last_candle['open'])
-            candle_range = last_candle['high'] - last_candle['low']
-            if candle_range > 0 and body_size > candle_range * 0.6:  # 60% body minimum
-                bear_score += 1
-                
-            potential_breakouts.append(('PE', bear_score))
-            
-        if not potential_breakouts:
-            return None, None, None
-            
-        # === 6. FALSE BREAKOUT PROTECTION ===
-        # Check recent breakout history to avoid failed breakout areas
-        for side, base_score in potential_breakouts:
-            false_breakout_penalty = 0
-            
-            # Check last 8 candles for recent failed breakouts
-            recent_data = df.iloc[-8:-1]  # Exclude current candle
-            
-            if side == 'CE':
-                # Check for recent failed bullish breakouts
-                failed_bull_attempts = 0
-                for i, candle in recent_data.iterrows():
-                    if (candle['high'] > range_high * 0.999 and  # Near breakout level
-                        candle['close'] <= range_high):          # But failed to sustain
-                        failed_bull_attempts += 1
-                        
-                if failed_bull_attempts >= 2:  # Multiple recent failures
-                    false_breakout_penalty = 1
-                    
-            else:  # PE
-                # Check for recent failed bearish breakouts
-                failed_bear_attempts = 0
-                for i, candle in recent_data.iterrows():
-                    if (candle['low'] < range_low * 1.001 and    # Near breakdown level
-                        candle['close'] >= range_low):           # But failed to sustain
-                        failed_bear_attempts += 1
-                        
-                if failed_bear_attempts >= 2:  # Multiple recent failures
-                    false_breakout_penalty = 1
-            
-            # === 6. MULTI-CANDLE CONFIRMATION ===
-            confirmation_bonus = 0
-            if len(df) >= 2:
-                # Check if previous candle also shows directional bias
-                if side == 'CE' and prev_candle['high'] > recent_candles.iloc[-2]['high']:
-                    confirmation_bonus = 1  # Previous candle supported upward move
-                elif side == 'PE' and prev_candle['low'] < recent_candles.iloc[-2]['low']:
-                    confirmation_bonus = 1  # Previous candle supported downward move
-            
-            # Calculate final quality score
-            quality_score = base_score + atr_squeeze_bonus + confirmation_bonus - false_breakout_penalty
-            
-            # === 3 & 4. SUPERTREND + VOLATILITY BREAKOUT COMBO ===
-            trend_alignment_bonus = 0
-            consolidation_above_supertrend_bonus = 0
-            allow_trade = False
-            
-            if 'supertrend_uptrend' in df.columns and 'supertrend' in df.columns:
-                curr_uptrend = last_candle.get('supertrend_uptrend')
-                supertrend_value = last_candle.get('supertrend')
-                
-                if pd.notna(curr_uptrend) and pd.notna(supertrend_value):
-                    
-                    # Check trend alignment
-                    trend_aligned = ((side == 'CE' and curr_uptrend) or 
-                                   (side == 'PE' and not curr_uptrend))
-                    
-                    if trend_aligned:
-                        trend_alignment_bonus = 1
-                        
-                        # === SUPERTREND + VOLATILITY COMBO: CONSOLIDATION ABOVE/BELOW SUPERTREND ===
-                        # Check if consolidation range is positioned correctly relative to Supertrend
-                        
-                        if side == 'CE' and curr_uptrend:
-                            # For bullish breakouts: consolidation should be ABOVE Supertrend line
-                            if range_low > supertrend_value:
-                                consolidation_above_supertrend_bonus = 2  # Premium setup bonus
-                                await self.strategy._log_debug("Supertrend Combo", 
-                                    f"🎯 Perfect BULL setup: Consolidation above Supertrend at {supertrend_value:.2f}")
-                            elif range_high > supertrend_value:
-                                consolidation_above_supertrend_bonus = 1  # Partial bonus
-                        
-                        elif side == 'PE' and not curr_uptrend:
-                            # For bearish breakouts: consolidation should be BELOW Supertrend line  
-                            if range_high < supertrend_value:
-                                consolidation_above_supertrend_bonus = 2  # Premium setup bonus
-                                await self.strategy._log_debug("Supertrend Combo", 
-                                    f"🎯 Perfect BEAR setup: Consolidation below Supertrend at {supertrend_value:.2f}")
-                            elif range_low < supertrend_value:
-                                consolidation_above_supertrend_bonus = 1  # Partial bonus
-                        
-                        allow_trade = True  # Standard trend-following trade
-                    else:
-                        # === 4. COUNTER-TREND TRADES WITH EXTRA CONFIRMATIONS ===
-                        # Allow counter-trend only with very high quality score
-                        if quality_score >= 5:  # Need exceptional setup for counter-trend
-                            allow_trade = True
-                            await self.strategy._log_debug("Counter-Trend", 
-                                f"High-quality counter-trend breakout: Score {quality_score}")
-                else:
-                    allow_trade = True  # No supertrend data, allow trade
-            else:
-                allow_trade = True  # No supertrend data, allow trade
-                
-            # Final scoring and decision
-            final_score = quality_score + trend_alignment_bonus + consolidation_above_supertrend_bonus
-            
-            if allow_trade and final_score >= 3:  # Minimum quality threshold
-                opt = self.strategy.get_entry_option(side)
-                if opt:
-                    # Generate descriptive trigger name based on quality
-                    if final_score >= 6:
-                        grade = "Premium"
-                    elif final_score >= 5:
-                        grade = "Strong" 
-                    elif final_score >= 4:
-                        grade = "Good"
-                    else:
-                        grade = "Basic"
-                        
-                    # Enhanced trigger naming for Supertrend combo setups
-                    if consolidation_above_supertrend_bonus >= 2:
-                        trigger = f"V47_Supertrend_Combo_{grade}_{side}"
-                    else:
-                        trigger = f"V47_Volatility_Breakout_{grade}_{side}"
-                        
-                    await self.strategy._log_debug("Enhanced Breakout", 
-                        f"🎯 {grade} breakout: Score {final_score}, Range {range_periods}c, "
-                        f"ATR squeeze: {atr_squeeze_bonus > 0}, Supertrend combo: {consolidation_above_supertrend_bonus}")
-                    return side, trigger, opt
-                    
-        return None, None, None
-
-# ==============================================================================
-# V47.14 ENTRY ENGINE 2: ENHANCED SUPERTREND FLIP 
-# ==============================================================================
-
-class V47SupertrendFlipEngine(BaseEntryStrategy):
-    """V47.14 Entry Logic 2: Enhanced Supertrend Flip Detection"""
+    Monitors BOTH CE and PE options simultaneously and enters whichever shows
+    the strongest setup, regardless of index trend direction.
     
-    async def check(self):
-        """Enhanced supertrend flip with close vs open validation"""
-        df = self.data_manager.data_df
-        if len(df) < 2 or 'supertrend_uptrend' not in df.columns:
-            return None, None, None
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        curr_uptrend = last.get('supertrend_uptrend')
-        prev_uptrend = prev.get('supertrend_uptrend')
-
-        if pd.isna(curr_uptrend) or pd.isna(prev_uptrend):
-            return None, None, None
-
-        flip_signals = []
-        
-        # Enhanced flip detection with candle confirmation
-        # Flipped to Bullish
-        if (prev_uptrend is False and curr_uptrend is True and 
-            last['close'] > last['open']):  # Green candle confirmation
-            flip_signals.extend([
-                ('CE', "V47_Enhanced_Supertrend_Flip_CE"), 
-                ('PE', "V47_Enhanced_Supertrend_Flip_PE_Alt")
-            ])
-            
-        # Flipped to Bearish  
-        elif (prev_uptrend is True and curr_uptrend is False and 
-              last['close'] < last['open']):  # Red candle confirmation
-            flip_signals.extend([
-                ('PE', "V47_Enhanced_Supertrend_Flip_PE"), 
-                ('CE', "V47_Enhanced_Supertrend_Flip_CE_Alt")
-            ])
-
-        # Return first valid signal (primary first, then alternate)
-        for side, trigger in flip_signals:
-            opt = self.strategy.get_entry_option(side)
-            if opt:
-                return side, trigger, opt
-                
-        return None, None, None
-
-# ==============================================================================
-# V47.14 ENTRY ENGINE 3: TREND CONTINUATION
-# ==============================================================================
-
-class V47TrendContinuationEngine(BaseEntryStrategy):
-    """V47.14 Entry Logic 3: Trend Continuation after consolidation"""
+    Scoring System (0-100 points):
+    - Green Candle: 30 points (LTP > Open)
+    - Velocity: 30 points (speed of price movement)
+    - Momentum: 20 points (40-second average trending up)
+    - Candle Position: 20 points (LTP near high of candle)
     
-    async def check(self):
-        """Trend continuation logic for established trends"""
-        df = self.data_manager.data_df
-        if len(df) < 10:  # Need history for trend analysis
-            return None, None, None
-            
-        # Determine overall trend state from supertrend
-        trend_state = await self._determine_trend_state()
-        if not trend_state:
-            return None, None, None
-            
-        current_price = self.data_manager.prices.get(self.strategy.index_symbol)
-        if not current_price:
-            return None, None, None
-            
-        # Check for range breakout in trend direction
-        recent_candles = df.iloc[-10:]  # Last 10 candles for range
-        recent_high = recent_candles['high'].max()
-        recent_low = recent_candles['low'].min()
-        
-        continuation_signal = None
-        
-        # Bullish trend continuation
-        if (trend_state == 'BULLISH' and 
-            current_price > recent_high):
-            continuation_signal = ('CE', 'V47_Trend_Continuation_CE')
-            
-        # Bearish trend continuation  
-        elif (trend_state == 'BEARISH' and 
-              current_price < recent_low):
-            continuation_signal = ('PE', 'V47_Trend_Continuation_PE')
-            
-        if continuation_signal:
-            side, trigger = continuation_signal
-            opt = self.strategy.get_entry_option(side)
-            if opt:
-                return side, trigger, opt
-                
-        return None, None, None
-    
-    async def _determine_trend_state(self):
-        """Determine overall trend from supertrend indicator"""
-        df = self.data_manager.data_df
-        if 'supertrend_uptrend' not in df.columns or len(df) < 5:
-            return None
-            
-        # Look at last 5 candles for trend consistency
-        recent_trend = df['supertrend_uptrend'].iloc[-5:]
-        
-        # Require at least 3 of last 5 candles in same trend
-        bullish_count = recent_trend.sum()
-        
-        if bullish_count >= 3:
-            return 'BULLISH'
-        elif bullish_count <= 2:
-            return 'BEARISH'
-        else:
-            return None  # Mixed/unclear trend
-
-# ==============================================================================
-# V47.14 ENTRY ENGINE 4: COUNTER-TREND/STEEP RE-ENTRY (LOWEST PRIORITY)
-# ==============================================================================
-
-class V47CounterTrendEngine(BaseEntryStrategy):
-    """V47.14 Entry Logic 4: Counter-trend/Steep re-entry for reversals"""
+    Entry Criteria:
+    - Option must score > 70/100
+    - If both score > 70, enter the one with higher score
+    - Still validates through standard filters (validation passed)
+    """
     
     def __init__(self, strategy_instance):
         super().__init__(strategy_instance)
-        self.pending_steep_signal = None
-        
+        self.min_score_threshold = 70  # Configurable minimum score
+        self.confirmation_ticks = 3  # Require score to remain high for 3 ticks
+        self.score_history = {}  # Track scores over time {symbol: [scores]}
+        self.last_log_time = 0  # Throttle score logging
+        self.log_interval = 2.0  # Log scores every 2 seconds
+        self.last_atm_strike = None  # Track ATM changes to clean history
+    
     async def check(self):
-        """Counter-trend detection with pending signal system"""
-        # First check any pending signals
-        if self.pending_steep_signal:
-            result = await self._validate_pending_signal()
-            if result:
-                return result
-                
-        # Look for new counter-trend setups
-        return await self._detect_counter_trend_setup()
-    
-    async def _detect_counter_trend_setup(self):
-        """Detect counter-trend opportunities"""
-        df = self.data_manager.data_df
-        if len(df) < 2:
-            return None, None, None
-            
-        # Get trend state and current candle
-        trend_state = await self._get_current_trend()
-        if not trend_state:
-            return None, None, None
-            
-        current_candle = df.iloc[-1]
-        is_red_candle = current_candle['close'] < current_candle['open']
-        is_green_candle = current_candle['close'] > current_candle['open'] 
+        """Check both CE and PE, return the strongest option"""
         
-        pending_signal = None
-        
-        # Counter-trend setups
-        if trend_state == 'BULLISH' and is_red_candle:
-            # Bullish trend but red candle - potential PE entry
-            pending_signal = {
-                'side': 'PE',
-                'trigger': 'V47_Counter_Trend_PE',
-                'created_at': datetime.now(),
-                'setup_type': 'counter_bullish_trend'
-            }
-            
-        elif trend_state == 'BEARISH' and is_green_candle:
-            # Bearish trend but green candle - potential CE entry  
-            pending_signal = {
-                'side': 'CE',
-                'trigger': 'V47_Counter_Trend_CE',
-                'created_at': datetime.now(),
-                'setup_type': 'counter_bearish_trend'
-            }
-            
-        if pending_signal:
-            self.pending_steep_signal = pending_signal
-            await self.strategy._log_debug("Counter-Trend", 
-                f"🔄 Pending {pending_signal['side']} counter-trend signal created")
-            
-        return None, None, None  # No immediate execution, must validate next tick
-    
-    async def _validate_pending_signal(self):
-        """Validate pending counter-trend signal with strict requirements"""
-        signal = self.pending_steep_signal
-        
-        # Check signal age (max 1 minute)
-        age = datetime.now() - signal['created_at']
-        if age > timedelta(minutes=1):
-            self.pending_steep_signal = None
-            await self.strategy._log_debug("Counter-Trend", "⏰ Pending signal expired")
+        # Don't check if already in position
+        if self.strategy.position:
             return None, None, None
         
-        # Get option for validation
-        opt = self.strategy.get_entry_option(signal['side'])
-        if not opt:
+        current_price = self.data_manager.prices.get(self.strategy.index_symbol)
+        if not current_price:
             return None, None, None
+        
+        # Calculate ATM strike
+        atm_strike = self.strategy.strike_step * round(current_price / self.strategy.strike_step)
+        
+        # Clean up score history if ATM changed (prevent memory leak)
+        if self.last_atm_strike != atm_strike:
+            # Keep only current and adjacent strikes
+            valid_strikes = [atm_strike - self.strategy.strike_step, atm_strike, atm_strike + self.strategy.strike_step]
+            symbols_to_keep = set()
+            for strike in valid_strikes:
+                ce_opt = self.strategy.get_entry_option('CE', strike)
+                pe_opt = self.strategy.get_entry_option('PE', strike)
+                if ce_opt:
+                    symbols_to_keep.add(ce_opt['tradingsymbol'])
+                if pe_opt:
+                    symbols_to_keep.add(pe_opt['tradingsymbol'])
             
-        # Enhanced validation required for counter-trend
-        if await self.strategy._enhanced_validate_entry_conditions_with_candle_color(
-            signal['side'], opt, is_counter_trend=True):
+            # Remove old symbols from history
+            symbols_to_remove = set(self.score_history.keys()) - symbols_to_keep
+            for symbol in symbols_to_remove:
+                del self.score_history[symbol]
             
-            # Clear pending signal and execute
-            self.pending_steep_signal = None
-            await self.strategy._log_debug("Counter-Trend", 
-                f"Counter-trend {signal['side']} validated and executing")
-            return signal['side'], signal['trigger'], opt
+            self.last_atm_strike = atm_strike
+        
+        # Get both CE and PE options
+        ce_option = self.strategy.get_entry_option('CE', atm_strike)
+        pe_option = self.strategy.get_entry_option('PE', atm_strike)
+        
+        # Score both options
+        ce_score = await self._score_option(ce_option, 'CE')
+        pe_score = await self._score_option(pe_option, 'PE')
+        
+        # Update score history for confirmation
+        if ce_option:
+            ce_symbol = ce_option['tradingsymbol']
+            if ce_symbol not in self.score_history:
+                self.score_history[ce_symbol] = []
+            self.score_history[ce_symbol].append(ce_score)
+            # Keep only last 5 scores
+            self.score_history[ce_symbol] = self.score_history[ce_symbol][-5:]
+        
+        if pe_option:
+            pe_symbol = pe_option['tradingsymbol']
+            if pe_symbol not in self.score_history:
+                self.score_history[pe_symbol] = []
+            self.score_history[pe_symbol].append(pe_score)
+            self.score_history[pe_symbol] = self.score_history[pe_symbol][-5:]
+        
+        # Log scores for visibility (throttled to avoid spam)
+        import time as time_module
+        current_time = time_module.time()
+        if current_time - self.last_log_time >= self.log_interval:
+            await self.strategy._log_debug("Dual Monitor", 
+                f"📊 CE Score: {ce_score}/100 | PE Score: {pe_score}/100")
+            self.last_log_time = current_time
+        
+        # Determine which option to enter
+        selected_side = None
+        selected_option = None
+        selected_score = 0
+        
+        # Check if CE meets threshold and has confirmation
+        if ce_score >= self.min_score_threshold and ce_option:
+            ce_symbol = ce_option['tradingsymbol']
+            if len(self.score_history.get(ce_symbol, [])) >= self.confirmation_ticks:
+                recent_scores = self.score_history[ce_symbol][-self.confirmation_ticks:]
+                if all(s >= self.min_score_threshold for s in recent_scores):
+                    selected_side = 'CE'
+                    selected_option = ce_option
+                    selected_score = ce_score
+        
+        # Check if PE meets threshold and has confirmation (and is stronger than CE)
+        if pe_score >= self.min_score_threshold and pe_option:
+            pe_symbol = pe_option['tradingsymbol']
+            if len(self.score_history.get(pe_symbol, [])) >= self.confirmation_ticks:
+                recent_scores = self.score_history[pe_symbol][-self.confirmation_ticks:]
+                if all(s >= self.min_score_threshold for s in recent_scores):
+                    if pe_score > selected_score:  # PE is stronger
+                        selected_side = 'PE'
+                        selected_option = pe_option
+                        selected_score = pe_score
+        
+        # If we have a winner, validate and return
+        if selected_side and selected_option:
+            await self.strategy._log_debug("Dual Monitor", 
+                f"🎯 {selected_side} selected with score {selected_score}/100")
             
+            # Validate through standard entry conditions
+            if await self._validate_entry_conditions(selected_side, selected_option):
+                reason = f'DualMonitor_{selected_side}_Score_{selected_score}'
+                return selected_side, reason, selected_option
+            else:
+                await self.strategy._log_debug("Dual Monitor", 
+                    f"❌ {selected_side} validation failed despite high score")
+        
         return None, None, None
     
-
-    
-    async def _get_current_trend(self):
-        """Get current trend state for counter-trend analysis"""
-        df = self.data_manager.data_df
-        if 'supertrend_uptrend' not in df.columns or len(df) < 1:
-            return None
-            
-        current_uptrend = df.iloc[-1].get('supertrend_uptrend')
-        if pd.isna(current_uptrend):
-            return None
-            
-        return 'BULLISH' if current_uptrend else 'BEARISH'
-
-# ==============================================================================
-# V47.14 STRATEGY COORDINATOR - PRIORITY SYSTEM
-# ==============================================================================
-
-class V47StrategyCoordinator:
-    """Coordinates all 4 V47.14 entry engines with proper priority"""
-    
-    def __init__(self, strategy_instance):
-        self.strategy = strategy_instance
+    async def _score_option(self, option, side):
+        """
+        Score an option from 0-100 based on multiple criteria
         
-        # Initialize all 4 engines in priority order
-        self.engines = [
-            V47VolatilityBreakoutEngine(strategy_instance),      # Priority 1
-            V47SupertrendFlipEngine(strategy_instance),          # Priority 2  
-            V47TrendContinuationEngine(strategy_instance),       # Priority 3
-            V47CounterTrendEngine(strategy_instance)             # Priority 4
-        ]
+        Returns:
+            int: Score from 0-100
+        """
+        if not option:
+            return 0
         
-        self.engine_names = [
-            "Volatility Breakout",
-            "Supertrend Flip", 
-            "Trend Continuation",
-            "Counter-Trend"
-        ]
-    
-    async def check_all_v47_entries(self):
-        """Check all engines in priority order - first valid signal wins"""
-        for i, engine in enumerate(self.engines):
-            try:
-                result = await engine.check()
-                if result and result[0] is not None:  # Valid signal found
-                    side, trigger, opt = result
-                    
-                    # Apply universal validation gauntlet
-                    if await self.strategy._enhanced_validate_entry_conditions_with_candle_color(
-                        side, opt, is_reversal=(i in [1, 3])):  # Flip and counter-trend are reversals
-                        
-                        await self.strategy._log_debug("V47 Coordinator", 
-                            f"{self.engine_names[i]} signal validated: {trigger}")
-                        
-                        # Execute the trade
-                        await self.strategy.take_trade(trigger, opt)
-                        return True
-                    else:
-                        await self.strategy._log_debug("V47 Coordinator", 
-                            f"{self.engine_names[i]} signal failed validation")
-                        
-            except Exception as e:
-                await self.strategy._log_debug("V47 Engine Error", 
-                    f"Error in {self.engine_names[i]}: {e}")
-                continue
-                
-        return False  # No valid signals found
-    
-    async def on_new_candle(self):
-        """Called when new minute candle forms - for crossover detection"""
-        # Specifically trigger supertrend flip detection on new candles
+        symbol = option['tradingsymbol']
+        ltp = self.data_manager.prices.get(symbol)
+        
+        if not ltp:
+            return 0
+        
+        score = 0
+        score_breakdown = []
+        
+        # CRITERION 1: Green Candle (30 points)
+        candle = self.data_manager.option_candles.get(symbol)
+        if candle and 'open' in candle:
+            candle_open = candle.get('open', ltp)
+            if ltp > candle_open:
+                score += 30
+                score_breakdown.append(f"Green:30")
+            else:
+                score_breakdown.append(f"Red:0")
+        
+        # CRITERION 2: Velocity (30 points)
         try:
-            flip_engine = self.engines[1]  # Supertrend flip engine
-            result = await flip_engine.check()
-            if result and result[0] is not None:
-                side, trigger, opt = result
-                
-                # Quick validation for new candle crossovers (reversal type)
-                if await self.strategy._enhanced_validate_entry_conditions_with_candle_color(
-                    side, opt, is_reversal=True):
-                    
-                    await self.strategy._log_debug("V47 New Candle", 
-                        f"New candle crossover validated: {trigger}")
-                    await self.strategy.take_trade(trigger, opt)
-                    return True
-                    
-        except Exception as e:
-            await self.strategy._log_debug("V47 New Candle Error", f"Error: {e}")
+            velocity = self.strategy.calculate_price_velocity(symbol, lookback_seconds=1.5)
+            if velocity >= 1.0:
+                score += 30
+                score_breakdown.append(f"Vel:30(₹{velocity:.2f}/s)")
+            elif velocity >= 0.5:
+                score += 20
+                score_breakdown.append(f"Vel:20(₹{velocity:.2f}/s)")
+            elif velocity >= 0.1:
+                score += 10
+                score_breakdown.append(f"Vel:10(₹{velocity:.2f}/s)")
+            else:
+                score_breakdown.append(f"Vel:0(₹{velocity:.2f}/s)")
+        except:
+            score_breakdown.append("Vel:0")
+        
+        # CRITERION 3: Momentum (20 points) - 40-second average trending up
+        if self.data_manager.is_average_price_trending(symbol, 'up'):
+            score += 20
+            score_breakdown.append("Mom:20")
+        else:
+            score_breakdown.append("Mom:0")
+        
+        # CRITERION 4: Early Body Formation (20 points) - Enter when body STARTS, not at peak
+        if candle and 'high' in candle and 'low' in candle and 'open' in candle:
+            candle_open = candle.get('open', ltp)
+            candle_high = candle.get('high', ltp)
+            candle_low = candle.get('low', ltp)
             
-        return False
-    
-    async def continuous_monitoring(self):
-        """Continuous tick-by-tick monitoring for immediate signals"""
-        # Run full priority check for non-crossover signals
-        return await self.check_all_v47_entries()
-
-# ==============================================================================
-# UOA COMPATIBILITY STRATEGY (EXTERNAL SIGNALS)
-# ==============================================================================
+            # Calculate body % from open
+            if candle_open > 0:
+                body_percent = abs((ltp - candle_open) / candle_open) * 100
+                
+                # GREEN CANDLE: Check if body is forming early
+                if ltp > candle_open:
+                    # Early entry zones (prioritize catching move early!)
+                    if body_percent >= 1.0 and body_percent <= 8.0:
+                        # Sweet spot: Body just started (1-8%) - BEST ENTRY!
+                        position_score = 20
+                        score_breakdown.append(f"Pos:20(Early{body_percent:.1f}%)")
+                    elif body_percent > 8.0 and body_percent <= 15.0:
+                        # Good entry: Body forming (8-15%)
+                        position_score = 18
+                        score_breakdown.append(f"Pos:18(Good{body_percent:.1f}%)")
+                    elif body_percent > 15.0 and body_percent <= 25.0:
+                        # OK entry: Body mid-size (15-25%)
+                        position_score = 15
+                        score_breakdown.append(f"Pos:15(Mid{body_percent:.1f}%)")
+                    elif body_percent > 25.0:
+                        # Late entry: Large body already formed (>25%) - might be near peak!
+                        # Check if still has momentum by looking at position in range
+                        candle_range = candle_high - candle_low
+                        if candle_range > 0:
+                            position = (ltp - candle_low) / candle_range
+                            if position >= 0.9:  # At peak (>90%)
+                                position_score = 5  # Too late!
+                                score_breakdown.append(f"Pos:5(Late{body_percent:.1f}%Peak)")
+                            elif position >= 0.7:  # High but not peak
+                                position_score = 10
+                                score_breakdown.append(f"Pos:10(Late{body_percent:.1f}%)")
+                            else:  # Still has room
+                                position_score = 15
+                                score_breakdown.append(f"Pos:15(Late{body_percent:.1f}%)")
+                        else:
+                            position_score = 10
+                            score_breakdown.append(f"Pos:10(Late{body_percent:.1f}%)")
+                    else:
+                        # Body too small (<1%) - wait for confirmation
+                        position_score = 5
+                        score_breakdown.append(f"Pos:5(Tiny{body_percent:.1f}%)")
+                    
+                    score += position_score
+                else:
+                    # RED CANDLE: No points
+                    score_breakdown.append("Pos:0(Red)")
+            else:
+                score_breakdown.append("Pos:0(NoOpen)")
+        
+        # Log detailed breakdown if score is significant
+        if score >= 50:
+            await self.strategy._log_debug("Dual Monitor Score", 
+                f"{symbol}: {score}/100 [{', '.join(score_breakdown)}]")
+        
+        return score
 
 class UoaEntryStrategy(BaseEntryStrategy):
-    """UOA strategy - external signal source for compatibility"""
     async def check(self):
-        if not self.strategy.uoa_watchlist: 
-            return None, None, None
+        if not self.strategy.uoa_watchlist: return None, None, None
         
         for token, data in list(self.strategy.uoa_watchlist.items()):
             symbol, side, strike = data['symbol'], data['type'], data['strike']
             option_candle = self.data_manager.option_candles.get(symbol)
             current_price = self.data_manager.prices.get(symbol)
-            
-            if not option_candle or 'open' not in option_candle or not current_price: 
-                continue
-                
+            if not option_candle or 'open' not in option_candle or not current_price: continue
             if current_price <= option_candle['open']:
+                await self.strategy._log_debug("UOA Trigger", f"REJECTED: {symbol} price {current_price} is not above its 1-min open {option_candle['open']}.")
                 continue
+            
+            # Late entry check REMOVED - Allow UOA entries at any time during candle
             
             opt = self.strategy.get_entry_option(side, strike)
-            if opt:
+            
+            if await self._validate_entry_conditions1(side, opt):
                 del self.strategy.uoa_watchlist[token]
                 await self.strategy._update_ui_uoa_list()
                 return side, "UOA_Entry", opt
-                
         return None, None, None
 
-# ==============================================================================
-# V47.14 FULL SYSTEM READY
-# All 4 entry engines + coordinator + universal validation system
-# ==============================================================================
+    async def _validate_entry_conditions1(self, side, opt):
+        if not opt: return False
+        symbol = opt['tradingsymbol']
+        log_report = []
+
+        is_trending = self.data_manager.is_average_price_trending(symbol, 'up')
+        log_report.append(f"Avg Price Trending: {is_trending}")
+        if not is_trending:
+            await self.strategy._log_debug("UOA Validation", f"REJECTED {symbol} | Report: [{', '.join(log_report)}]")
+            return False
+
+        momentum_is_ok = self._momentum_ok(side, symbol)
+        log_report.append(f"Momentum OK: {momentum_is_ok}")
+        if not momentum_is_ok:
+            await self.strategy._log_debug("UOA Validation", f"REJECTED {symbol} | Report: [{', '.join(log_report)}]")
+            return False
+        
+        await self.strategy._log_debug("UOA Validation", f"PASS {symbol} | Report: [{', '.join(log_report)}]")
+        return True
+
+class TrendContinuationStrategy(BaseEntryStrategy):
+    async def check(self):
+        trend = self.data_manager.trend_state
+        if not trend or len(self.data_manager.data_df) < 2: return None, None, None
+        prev_candle = self.data_manager.data_df.iloc[-1]
+        current_price = self.data_manager.prices.get(self.strategy.index_symbol)
+        if not current_price: return None, None, None
+        side, reason = None, None
+        
+        # --- MODIFIED LOGIC: Index Breakout Check ---
+        if trend == 'BULLISH' and current_price > prev_candle['high']: 
+            side, reason = 'CE', 'Trend_Continuation_CE_Breakout'
+        elif trend == 'BEARISH' and current_price < prev_candle['low']: 
+            side, reason = 'PE', 'Trend_Continuation_PE_Breakout'
+        # --- END MODIFIED LOGIC ---
+
+        if side:
+            opt = self.strategy.get_entry_option(side)
+            # _validate_entry_conditions now contains the "Green Candle" check
+            if await self._validate_entry_conditions(side, opt):
+                return side, reason, opt
+        return None, None, None
+
+class MaCrossoverStrategy(BaseEntryStrategy):
+    async def check(self):
+        df = self.data_manager.data_df
+        if len(df) < 2: return None, None, None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        if any(pd.isna(v) for v in [last['wma'], last['sma'], prev['wma'], prev['sma']]): return None, None, None
+        side, reason = None, None
+        if prev['wma'] <= prev['sma'] and last['wma'] > last['sma'] and last['close'] > last['open']: side, reason = 'CE', "MA_Crossover_CE"
+        elif prev['wma'] >= prev['sma'] and last['wma'] < last['sma'] and last['close'] < last['open']: side, reason = 'PE', "MA_Crossover_PE"
+        if side:
+            opt = self.strategy.get_entry_option(side)
+            if await self._validate_entry_conditions(side, opt):
+                return side, reason, opt
+        return None, None, None
+
+class CandlePatternEntryStrategy(BaseEntryStrategy):
+    async def check(self):
+        df = self.data_manager.data_df
+        if len(df) < 3 or not self.data_manager.trend_state: return None, None, None
+        last = df.iloc[-1]
+        pattern, side = None, None
+        if is_doji(last) and self.strategy.trend_candle_count >= 5:
+            if self.data_manager.trend_state == 'BULLISH': pattern, side = 'Doji_Reversal_Elite', 'PE'
+            elif self.data_manager.trend_state == 'BEARISH': pattern, side = 'Doji_Reversal_Elite', 'CE'
+        if pattern:
+            opt = self.strategy.get_entry_option(side)
+            if await self._validate_entry_conditions(side, opt):
+                return side, pattern, opt
+        return None, None, None
+
+class IntraCandlePatternStrategy(BaseEntryStrategy):
+    async def check(self):
+        if self.strategy.position: return None, None, None
+        df = self.data_manager.data_df
+        if len(df) < 3 or 'open' not in self.data_manager.current_candle: return None, None, None
+        live_candle = self.data_manager.current_candle
+        prev_candle = df.iloc[-1]
+        prev_candle_2 = df.iloc[-2]
+        pattern, side = None, None
+        if is_bullish_engulfing(prev_candle, live_candle): pattern, side = 'Live_BullishEngulf', 'CE'
+        elif is_bearish_engulfing(prev_candle, live_candle): pattern, side = 'Live_BearishEngulf', 'PE'
+        elif is_morning_star(prev_candle_2, prev_candle, live_candle): pattern, side = 'Live_MorningStar', 'CE'
+        elif is_evening_star(prev_candle_2, prev_candle, live_candle): pattern, side = 'Live_EveningStar', 'PE'
+        elif is_hammer(live_candle) and self.data_manager.trend_state == 'BEARISH': pattern, side = 'Live_Hammer', 'CE'
+        elif is_hanging_man(live_candle) and self.data_manager.trend_state == 'BULLISH': pattern, side = 'Live_HangingMan', 'PE'
+        if pattern:
+            opt = self.strategy.get_entry_option(side)
+            if await self._validate_entry_conditions(side, opt):
+                return side, pattern, opt
+        return None, None, None

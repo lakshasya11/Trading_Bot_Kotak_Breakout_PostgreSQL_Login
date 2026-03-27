@@ -4,9 +4,11 @@ import AnalyticsPanel from './AnalyticsPanel'; // NEW: Import the reusable compo
 
 function TabPanel(props) {
     const { children, value, index, ...other } = props;
+    const isActive = value === index;
+    console.log(`TabPanel ${index} - Active: ${isActive}`);
     return (
-        <div role="tabpanel" hidden={value !== index} style={{ height: '100%' }} {...other}>
-            {value === index && <Box sx={{ p: 1, height: '100%' }}>{children}</Box>}
+        <div role="tabpanel" hidden={!isActive} style={{ height: '100%' }} {...other}>
+            {isActive && <Box sx={{ p: 1, height: '100%' }}>{children}</Box>}
         </div>
     );
 }
@@ -14,7 +16,10 @@ function TabPanel(props) {
 // CHANGED: Component no longer needs `tradeHistory` prop
 export default function LogTabs({ debugLogs }) {
     const [value, setValue] = useState(0);
-    const handleChange = (event, newValue) => setValue(newValue);
+    const handleChange = (event, newValue) => {
+        console.log(`📑 Tab switched from ${value} to ${newValue}`);
+        setValue(newValue);
+    };
 
     return (
         <Paper elevation={3} sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -56,12 +61,12 @@ export default function LogTabs({ debugLogs }) {
 
             <TabPanel value={value} index={1}>
                 {/* NEW: Use the reusable panel for today's data */}
-                <AnalyticsPanel scope="today" />
+                <AnalyticsPanel scope="today" viewType="trades" />
             </TabPanel>
             
             <TabPanel value={value} index={2}>
-                {/* NEW: Use the reusable panel for all data */}
-                <AnalyticsPanel scope="all" />
+                {/* NEW: Use the reusable panel for all data with date-wise view */}
+                <AnalyticsPanel scope="all" viewType="daily" />
             </TabPanel>
         </Paper>
     );
