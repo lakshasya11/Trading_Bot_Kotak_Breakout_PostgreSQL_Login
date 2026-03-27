@@ -1011,7 +1011,15 @@ async def logout(service: TradingBotService = Depends(get_bot_service)):
             except Exception as e:
                 print(f"Error stopping bot during logout: {e}")
 
-        # 2. Clear the access token to invalidate session
+        # 2. Call Kotak logout API to invalidate session server-side
+        try:
+            if hasattr(kite, 'logout'):
+                await kite.logout()
+                print("[OK] Kotak session invalidated")
+        except Exception as e:
+            print(f"[WARNING] Kotak logout API error: {e}")
+
+        # 3. Clear the access token to invalidate session
         from core.broker_factory import clear_access_token
         try:
             clear_access_token()

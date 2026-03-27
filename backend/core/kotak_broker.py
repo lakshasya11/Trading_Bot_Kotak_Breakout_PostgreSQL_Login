@@ -956,3 +956,23 @@ class KotakBroker(BrokerInterface):
 
     async def shutdown(self):
         self._shutting_down = True
+
+    async def logout(self):
+        """Call Kotak Neo logout API to invalidate the session server-side."""
+        if not self._session_token or not self._base_url:
+            return
+        try:
+            url = f"{self._base_url}/login/1.0/logout"
+            headers = self._post_login_headers()
+            headers["Content-Type"] = "application/json"
+            await asyncio.to_thread(
+                self._http_request, "POST", url, headers, "{}"
+            )
+            print("[KOTAK] Logged out from Kotak Neo API successfully")
+        except Exception as e:
+            print(f"[KOTAK] Logout API call failed (session may already be expired): {e}")
+        finally:
+            self._session_token = None
+            self._session_sid = None
+            self._base_url = None
+            self._access_token = ""
